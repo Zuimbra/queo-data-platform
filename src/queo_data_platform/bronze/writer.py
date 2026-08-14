@@ -54,23 +54,20 @@ def align_dataframe_to_target_schema(
 
     aligned = dataframe.copy()
 
-    # Completa colunas que já existem na tabela,
-    # mas não chegaram neste arquivo.
     for column in target_columns:
         if column not in aligned.columns:
             aligned[column] = None
 
-    # Descobre eventuais colunas novas da fonte.
     new_columns = [column for column in aligned.columns if column not in target_columns]
 
-    # Primeiro mantemos a ordem conhecida do target.
-    # Depois colocamos eventuais colunas novas.
-    return aligned[
-        [
-            *target_columns,
-            *new_columns,
-        ]
+    ordered_columns = [
+        *target_columns,
+        *new_columns,
     ]
+
+    return aligned.reindex(
+        columns=ordered_columns,
+    )
 
 
 def validate_bronze_dataframe(
