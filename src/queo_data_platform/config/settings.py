@@ -13,8 +13,17 @@ class Settings:
     # Diretório principal de dados.
     data_dir: Path
 
-    # Dados de entrada ainda não processados.
+    # Raiz dos dados brutos.
     raw_dir: Path
+
+    # Arquivos aguardando processamento.
+    inbox_dir: Path
+
+    # Arquivos processados com sucesso.
+    archive_dir: Path
+
+    # Arquivos rejeitados durante a ingestão.
+    quarantine_dir: Path
 
     # Raiz das camadas do Lakehouse.
     lakehouse_dir: Path
@@ -57,6 +66,9 @@ def load_settings() -> Settings:
         project_root=project_root,
         data_dir=data_dir,
         raw_dir=raw_dir,
+        inbox_dir=raw_dir / "inbox",
+        archive_dir=raw_dir / "archive",
+        quarantine_dir=raw_dir / "quarantine",
         lakehouse_dir=lakehouse_dir,
         control_dir=lakehouse_dir / "00_control",
         bronze_dir=lakehouse_dir / "01_bronze",

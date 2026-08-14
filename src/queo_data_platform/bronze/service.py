@@ -23,6 +23,7 @@ from queo_data_platform.bronze.validation import (
 from queo_data_platform.bronze.writer import (
     write_bronze_table,
 )
+from queo_data_platform.config.settings import Settings
 from queo_data_platform.contracts.tracker import (
     BRONZE_TABLE_NAME,
 )
@@ -69,7 +70,6 @@ def load_bronze_data(
     Executa o fluxo completo de ingestão Bronze.
 
     Fluxo:
-
         inbox
           ↓
         discovery
@@ -90,7 +90,6 @@ def load_bronze_data(
     input_files = discover_csv_files(inbox_dir)
 
     control_path = get_control_table_path(control_dir)
-
     bronze_table_path = bronze_dir / BRONZE_TABLE_NAME
 
     # Carregamos uma única vez o estado persistido.
@@ -110,7 +109,6 @@ def load_bronze_data(
 
     for source_path in input_files:
         batch_id = generate_batch_id()
-
         started_at = datetime.now(UTC)
 
         source_file_hash: str | None = None
@@ -121,7 +119,6 @@ def load_bronze_data(
 
         try:
             source_file_hash = calculate_file_sha256(source_path)
-
         except (OSError, ValueError) as error:
             record_ingestion_status(
                 control_path,
@@ -159,7 +156,7 @@ def load_bronze_data(
                 source_file_hash=source_file_hash,
                 status="SKIPPED",
                 started_at=started_at,
-                status_reason=("SOURCE_FILE_HASH_ALREADY_SUCCESSFUL"),
+                status_reason="SOURCE_FILE_HASH_ALREADY_SUCCESSFUL",
             )
 
             skipped_files.append(source_path.name)
@@ -203,7 +200,7 @@ def load_bronze_data(
                 source_file_hash=source_file_hash,
                 status="FAILED",
                 started_at=started_at,
-                row_count=(validation_result.row_count),
+                row_count=validation_result.row_count,
                 status_reason="VALIDATION_FAILED",
                 error_message=error_message,
             )
@@ -224,16 +221,16 @@ def load_bronze_data(
 
         try:
             bronze_dataframe = add_lineage_metadata(
-                dataframe=(validation_result.dataframe),
+                dataframe=validation_result.dataframe,
                 source_path=source_path,
                 batch_id=batch_id,
-                source_file_hash=(source_file_hash),
+                source_file_hash=source_file_hash,
                 ingested_at=started_at,
             )
 
             write_result = write_bronze_table(
                 dataframe=bronze_dataframe,
-                table_path=(bronze_table_path),
+                table_path=bronze_table_path,
             )
 
         except (
@@ -248,7 +245,7 @@ def load_bronze_data(
                 source_file_hash=source_file_hash,
                 status="FAILED",
                 started_at=started_at,
-                row_count=(validation_result.row_count),
+                row_count=validation_result.row_count,
                 status_reason="BRONZE_WRITE_FAILED",
                 error_message=str(error),
             )
@@ -275,16 +272,14 @@ def load_bronze_data(
             status="SUCCESS",
             started_at=started_at,
             row_count=write_result.row_count,
-            inserted_row_count=(write_result.inserted_row_count),
-            duplicate_row_count=(write_result.duplicate_row_count),
+            inserted_row_count=write_result.inserted_row_count,
+            duplicate_row_count=write_result.duplicate_row_count,
         )
 
         successful_hashes.add(source_file_hash)
-
         successful_files.append(source_path.name)
 
         inserted_row_count += write_result.inserted_row_count
-
         duplicate_row_count += write_result.duplicate_row_count
 
         # Só propagamos para a Silver batches que realmente
@@ -304,6 +299,26 @@ def load_bronze_data(
         skipped_files=tuple(skipped_files),
         failed_files=tuple(failed_files),
         batch_ids=tuple(inserted_batch_ids),
-        inserted_row_count=(inserted_row_count),
-        duplicate_row_count=(duplicate_row_count),
+        inserted_row_count=inserted_row_count,
+        duplicate_row_count=duplicate_row_count,
+    )
+
+
+def load_bronze(
+    settings: Settings,
+) -> BronzeLoadResult:
+    """
+    Executa a ingestão Bronze utilizando a configuração
+    da plataforma.
+
+    Esta é a interface de alto nível que será utilizada
+    pela futura orquestração do pipeline.
+    """
+
+    return load_bronze_data(
+        inbox_dir=settings.inbox_dir,
+        archive_dir=settings.archive_dir,
+        quarantine_dir=settings.quarantine_dir,
+        bronze_dir=settings.bronze_dir,
+        control_dir=settings.control_dir,
     )
