@@ -1093,8 +1093,8 @@ Latin-1
 O Pandas é chamado com:
 
 ```python
-dtype=str
-keep_default_na=False
+dtype = str
+keep_default_na = False
 ```
 
 ## Para que?
