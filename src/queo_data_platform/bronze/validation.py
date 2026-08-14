@@ -6,7 +6,7 @@ from pandas.errors import EmptyDataError, ParserError
 
 from queo_data_platform.contracts.tracker import (
     BRONZE_METADATA_COLUMNS,
-    RAW_TRACKER_COLUMNS,
+    RAW_TRACKER_REQUIRED_COLUMNS,
 )
 
 
@@ -95,7 +95,9 @@ def find_missing_columns(
     available_columns = set(dataframe.columns)
 
     return tuple(
-        column for column in RAW_TRACKER_COLUMNS if column not in available_columns
+        column
+        for column in RAW_TRACKER_REQUIRED_COLUMNS
+        if column not in available_columns
     )
 
 

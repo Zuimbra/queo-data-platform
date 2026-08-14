@@ -8,7 +8,7 @@ from queo_data_platform.bronze.validation import (
     validate_input_file,
 )
 from queo_data_platform.contracts.tracker import (
-    RAW_TRACKER_COLUMNS,
+    RAW_TRACKER_REQUIRED_COLUMNS,
 )
 
 
@@ -16,7 +16,7 @@ def build_valid_csv(
     file_path: Path,
     extra_columns: dict[str, str] | None = None,
 ) -> None:
-    data = {column: ["value"] for column in RAW_TRACKER_COLUMNS}
+    data = {column: ["value"] for column in RAW_TRACKER_REQUIRED_COLUMNS}
 
     if extra_columns:
         data.update({column: [value] for column, value in extra_columns.items()})
@@ -67,7 +67,7 @@ def test_missing_required_column_is_rejected(
 ) -> None:
     file_path = tmp_path / "missing.csv"
 
-    columns = [column for column in RAW_TRACKER_COLUMNS if column != "LAT"]
+    columns = [column for column in RAW_TRACKER_REQUIRED_COLUMNS if column != "LAT"]
 
     pd.DataFrame({column: ["value"] for column in columns}).to_csv(
         file_path, index=False
