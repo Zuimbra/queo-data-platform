@@ -3,6 +3,7 @@ from pathlib import Path
 from queo_data_platform.bronze.files import (
     calculate_file_sha256,
     discover_csv_files,
+    move_file,
 )
 
 
@@ -78,3 +79,51 @@ def test_different_file_contents_generate_different_hashes(
     second_file.write_text("content B")
 
     assert calculate_file_sha256(first_file) != calculate_file_sha256(second_file)
+
+
+def test_move_file_moves_source_to_destination(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "source"
+    destination_dir = tmp_path / "archive"
+
+    source_dir.mkdir()
+
+    source_path = source_dir / "tracker.csv"
+
+    source_path.write_text("data")
+
+    destination_path = move_file(
+        source_path,
+        destination_dir,
+    )
+
+    assert not source_path.exists()
+    assert destination_path.exists()
+    assert destination_path.name == "tracker.csv"
+
+
+def test_move_file_uses_suffix_on_name_collision(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "source"
+    destination_dir = tmp_path / "archive"
+
+    source_dir.mkdir()
+    destination_dir.mkdir()
+
+    source_path = source_dir / "tracker.csv"
+
+    source_path.write_text("new")
+
+    (destination_dir / "tracker.csv").write_text("old")
+
+    destination_path = move_file(
+        source_path,
+        destination_dir,
+        conflict_suffix="batch-001",
+    )
+
+    assert destination_path.name == "tracker__batch-001.csv"
+
+    assert destination_path.read_text() == "new"

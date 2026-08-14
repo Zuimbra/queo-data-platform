@@ -1,5 +1,6 @@
 from hashlib import sha256
 from pathlib import Path
+from shutil import move
 
 
 def discover_csv_files(inbox_dir: Path) -> list[Path]:
@@ -13,26 +14,15 @@ def discover_csv_files(inbox_dir: Path) -> list[Path]:
     comportamento determinístico entre execuções.
     """
 
-    # Um inbox ainda não criado representa simplesmente
-    # ausência de arquivos para processar.
     if not inbox_dir.exists():
         return []
 
-    # Percorre somente o primeiro nível do diretório.
-    #
-    # is_file():
-    # garante que diretórios não sejam retornados.
-    #
-    # suffix.lower():
-    # permite extensões como .csv e .CSV.
     csv_files = [
         path
         for path in inbox_dir.iterdir()
         if path.is_file() and path.suffix.lower() == ".csv"
     ]
 
-    # A ordenação evita que a ordem de processamento dependa
-    # do sistema operacional ou do filesystem.
     return sorted(
         csv_files,
         key=lambda path: path.name.lower(),
@@ -42,24 +32,56 @@ def discover_csv_files(inbox_dir: Path) -> list[Path]:
 def calculate_file_sha256(file_path: Path) -> str:
     """
     Calcula o SHA-256 do conteúdo de um arquivo.
-
-    O hash identifica o conteúdo do arquivo independentemente
-    de seu nome e será usado posteriormente no controle de
-    ingestão e na idempotência da Bronze.
     """
 
-    # Inicializa o algoritmo SHA-256.
     digest = sha256()
 
-    # O arquivo é lido em modo binário porque o hash deve ser
-    # calculado sobre os bytes reais, sem depender de encoding.
     with file_path.open("rb") as file:
-        # Processa o arquivo em blocos de 1 MiB.
-        #
-        # Isso evita carregar arquivos potencialmente grandes
-        # inteiros na memória.
         while chunk := file.read(1024 * 1024):
             digest.update(chunk)
 
-    # SHA-256 em representação hexadecimal possui 64 caracteres.
     return digest.hexdigest()
+
+
+def move_file(
+    source_path: Path,
+    destination_dir: Path,
+    *,
+    conflict_suffix: str | None = None,
+) -> Path:
+    """
+    Move um arquivo para outro diretório.
+
+    Se já existir um arquivo com o mesmo nome no destino,
+    conflict_suffix é acrescentado ao nome para evitar overwrite.
+    """
+
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Arquivo de origem não encontrado: {source_path}")
+
+    destination_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    destination_path = destination_dir / source_path.name
+
+    if destination_path.exists():
+        if not conflict_suffix:
+            raise FileExistsError(
+                f"Já existe um arquivo com o mesmo nome no destino: {destination_path}"
+            )
+
+        destination_path = destination_dir / (
+            f"{source_path.stem}__{conflict_suffix}{source_path.suffix}"
+        )
+
+    if destination_path.exists():
+        raise FileExistsError(f"O arquivo de destino já existe: {destination_path}")
+
+    move(
+        str(source_path),
+        str(destination_path),
+    )
+
+    return destination_path
