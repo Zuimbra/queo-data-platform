@@ -1,0 +1,18 @@
+[project]
+name = "queo-data-platform"
+version = "0.1.0"
+description = "Enterprise data platform for ingestion, Lakehouse processing, APIs, analytics, and MCP integration."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "ruff>=0.16.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13"]
+build-backend = "uv_build"
