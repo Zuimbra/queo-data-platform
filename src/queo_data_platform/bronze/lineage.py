@@ -62,9 +62,7 @@ def calculate_row_id(
     if source_row_number < 1:
         raise ValueError("source_row_number precisa começar em 1.")
 
-    identity = (
-        f"{source_file_hash}:{source_row_number}"
-    ).encode()
+    identity = (f"{source_file_hash}:{source_row_number}").encode()
 
     return sha256(identity).hexdigest()
 
