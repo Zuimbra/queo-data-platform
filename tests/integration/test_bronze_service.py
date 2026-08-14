@@ -276,13 +276,9 @@ def test_bronze_can_run_from_settings(
 
     source_file = settings.inbox_dir / "tracker.csv"
 
-    create_valid_tracker_file(
-        source_file,
-    )
+    create_valid_tracker_file(source_file)
 
-    result = load_bronze(
-        settings,
-    )
+    result = load_bronze(settings)
 
     assert result.has_new_data
     assert result.inserted_row_count == 1
@@ -291,9 +287,7 @@ def test_bronze_can_run_from_settings(
 
     assert (settings.bronze_dir / BRONZE_TABLE_NAME).exists()
 
-    assert get_control_table_path(
-        settings.control_dir,
-    ).exists()
+    assert get_control_table_path(settings.control_dir).exists()
 
 
 def test_multiple_files_are_processed_in_one_run(
