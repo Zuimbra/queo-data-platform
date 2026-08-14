@@ -432,10 +432,10 @@ O operador `/` de `Path` monta caminhos.
 Depois:
 
 ```python
-control_dir=lakehouse_dir / "00_control",
-bronze_dir=lakehouse_dir / "01_bronze",
-silver_dir=lakehouse_dir / "02_silver",
-gold_dir=lakehouse_dir / "03_gold",
+control_dir = (lakehouse_dir / "00_control",)
+bronze_dir = (lakehouse_dir / "01_bronze",)
+silver_dir = (lakehouse_dir / "02_silver",)
+gold_dir = (lakehouse_dir / "03_gold",)
 ```
 
 centraliza os diretórios de cada camada.

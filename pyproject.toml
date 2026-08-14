@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Enterprise data platform for ingestion, Lakehouse processing, APIs, analytics, and MCP integration."
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "pandas>=3.0.5",
+]
 
 [dependency-groups]
 dev = [
