@@ -1907,5 +1907,1580 @@ archive / quarantine
  ↓
 registrar resultado
 ```
+---
 
+# 37. Criar a tabela de controle da ingestão
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── bronze/
+        └── control.py
+```
+
+A tabela lógica utilizada para controle recebeu o nome:
+
+```python
+CONTROL_TABLE_NAME = "ingestion_files"
+```
+
+e é armazenada dentro de:
+
+```text
+data/
+└── lakehouse/
+    └── 00_control/
+        └── ingestion_files/
+```
+
+## O que?
+
+A tabela de controle registra o histórico operacional dos arquivos processados pela Bronze.
+
+Até esse momento já existiam mecanismos para:
+
+```text
+descobrir arquivos
+calcular hash
+validar CSV
+adicionar lineage
+escrever tracker_logs
+```
+
+Porém ainda não havia um registro persistente que respondesse perguntas como:
+
+```text
+esse arquivo já foi processado?
+quando ele começou a ser processado?
+terminou com sucesso?
+falhou?
+quantas linhas foram inseridas?
+quantas foram consideradas duplicadas?
+```
+
+A control table passa a exercer essa responsabilidade.
+
+## Para que?
+
+Separar dois tipos de informação:
+
+```text
+tracker_logs
+→ dados de negócio ingeridos
+
+ingestion_files
+→ dados operacionais sobre a ingestão
+```
+
+Assim, informações de controle não precisam ser armazenadas dentro dos próprios registros de telemetria.
+
+---
+
+# 38. Criar `IngestionControlEvent`
+
+Foi criada a dataclass:
+
+```python
+@dataclass(frozen=True)
+class IngestionControlEvent:
+```
+
+Ela representa um evento do histórico de processamento.
+
+Os principais campos são:
+
+```text
+control_event_id
+batch_id
+source_file
+source_file_hash
+status
+stage
+started_at
+finished_at
+row_count
+inserted_row_count
+duplicate_row_count
+status_reason
+error_message
+recorded_at
+```
+
+## O que?
+
+Cada mudança relevante no processamento de um arquivo gera um novo evento.
+
+Exemplo:
+
+```text
+tracker.csv
+    ↓
+PROCESSING
+    ↓
+SUCCESS
+```
+
+não é representado atualizando uma mesma linha.
+
+São gravados dois registros:
+
+```text
+evento 1
+status = PROCESSING
+
+evento 2
+status = SUCCESS
+```
+
+## Para que?
+
+Preservar o histórico completo da ingestão.
+
+Uma estratégia baseada em UPDATE produziria apenas:
+
+```text
+tracker.csv | SUCCESS
+```
+
+e perderia a informação de que o arquivo anteriormente esteve em processamento.
+
+Com eventos append-only:
+
+```text
+tracker.csv | PROCESSING
+tracker.csv | SUCCESS
+```
+
+o histórico permanece disponível.
+
+---
+
+# 39. Definir os estados da ingestão
+
+Foram definidos quatro estados:
+
+```python
+ControlStatus = Literal[
+    "PROCESSING",
+    "SUCCESS",
+    "FAILED",
+    "SKIPPED",
+]
+```
+
+## `PROCESSING`
+
+Indica que uma tentativa de ingestão foi iniciada.
+
+```text
+arquivo descoberto
+    ↓
+hash calculado
+    ↓
+PROCESSING
+```
+
+## `SUCCESS`
+
+Indica que o arquivo concluiu a ingestão.
+
+Pode conter:
+
+```text
+row_count
+inserted_row_count
+duplicate_row_count
+```
+
+## `FAILED`
+
+Indica que a tentativa não foi concluída.
+
+O evento pode registrar:
+
+```text
+status_reason
+error_message
+```
+
+Exemplos de motivos posteriormente utilizados:
+
+```text
+FILE_HASH_ERROR
+VALIDATION_FAILED
+BRONZE_WRITE_FAILED
+```
+
+## `SKIPPED`
+
+Indica que o arquivo não precisou ser novamente ingerido.
+
+O principal caso é:
+
+```text
+SHA-256
+   ↓
+já existe SUCCESS para esse conteúdo
+   ↓
+SKIPPED
+```
+
+---
+
+# 40. Tornar a control table append-only
+
+Foi criada:
+
+```python
+append_control_event(...)
+```
+
+A estratégia de escrita é:
+
+```text
+tabela ainda não existe
+        ↓
+mode="overwrite"
+        ↓
+criação inicial
+
+tabela já existe
+        ↓
+mode="append"
+        ↓
+novo evento
+```
+
+Não existe atualização dos eventos antigos.
+
+O comportamento esperado é:
+
+```text
+tentativa 1
+PROCESSING
+FAILED
+
+tentativa 2
+PROCESSING
+SUCCESS
+
+tentativa 3
+SKIPPED
+```
+
+## Para que?
+
+Permitir auditoria do ciclo de vida dos arquivos.
+
+Também evita transformar a tabela de controle em uma estrutura cujo significado dependa de updates sucessivos sobre um único registro.
+
+---
+
+# 41. Criar schema PyArrow explícito para o controle
+
+A transformação:
+
+```python
+control_event_to_arrow_table(...)
+```
+
+utiliza um schema PyArrow explícito.
+
+Exemplo:
+
+```text
+control_event_id      string
+batch_id              string
+source_file           string
+source_file_hash      string nullable
+status                string
+started_at            timestamp UTC
+finished_at           timestamp UTC nullable
+row_count             int64 nullable
+inserted_row_count    int64 nullable
+duplicate_row_count   int64 nullable
+status_reason         string nullable
+error_message         string nullable
+recorded_at           timestamp UTC
+```
+
+## O que?
+
+Campos como:
+
+```text
+finished_at
+row_count
+error_message
+```
+
+podem inicialmente possuir:
+
+```python
+None
+```
+
+Por exemplo, um evento:
+
+```text
+PROCESSING
+```
+
+normalmente ainda não possui `finished_at`.
+
+Sem schema explícito, uma coluna contendo somente valores nulos poderia ser inferida de forma inadequada.
+
+## Para que?
+
+Garantir que o tipo da coluna seja conhecido mesmo quando o primeiro registro armazenado contiver `NULL`.
+
+Assim:
+
+```text
+NULL
+```
+
+continua sendo um valor possível de:
+
+```text
+string
+timestamp
+int64
+```
+
+e não passa a definir o tipo da coluna.
+
+---
+
+# 42. Detectar arquivos anteriormente processados com sucesso
+
+Foi criada:
+
+```python
+load_successful_file_hashes(...)
+```
+
+A função consulta apenas:
+
+```text
+source_file_hash
+status
+```
+
+da tabela:
+
+```text
+00_control/ingestion_files
+```
+
+e retorna os hashes associados a:
+
+```text
+status == SUCCESS
+```
+
+Também foi criada:
+
+```python
+should_skip_file_hash(...)
+```
+
+## O que?
+
+A decisão de reprocessamento passou a funcionar assim:
+
+```text
+novo arquivo
+    ↓
+SHA-256
+    ↓
+buscar hashes com SUCCESS
+    ↓
+hash encontrado?
+   / \
+ sim  não
+ ↓     ↓
+SKIP  processar
+```
+
+## Para que?
+
+Evitar depender do nome físico do arquivo para definir identidade.
+
+Dois arquivos:
+
+```text
+tracker_a.csv
+tracker_b.csv
+```
+
+podem possuir exatamente o mesmo conteúdo.
+
+Nesse caso:
+
+```text
+SHA256(tracker_a.csv)
+==
+SHA256(tracker_b.csv)
+```
+
+e o segundo não precisa ser ingerido novamente depois que o primeiro já concluiu com `SUCCESS`.
+
+---
+
+# 43. Criar testes da tabela de controle
+
+Foi criado:
+
+```text
+tests/
+└── unit/
+    └── test_bronze_control.py
+```
+
+Os testes cobrem comportamentos como:
+
+```text
+PROCESSING não possui finished_at
+estado final recebe finished_at
+status inválido é rejeitado
+row_count negativo é rejeitado
+schema Arrow mantém tipos nullable
+control table é append-only
+somente hashes com SUCCESS são carregados
+hash conhecido deve ser ignorado
+hash desconhecido deve ser processado
+```
+
+Um teste importante grava:
+
+```text
+PROCESSING
+SUCCESS
+```
+
+na mesma Delta Table e verifica que existem:
+
+```text
+2 registros
+```
+
+em vez de apenas o estado final.
+
+## Para que?
+
+Validar que o controle operacional funciona como histórico e não como uma tabela mutável de estado atual.
+
+---
+
+# 44. Corrigir a tipagem do alinhamento de schema
+
+Durante a validação com:
+
+```powershell
+uv run pyright
+```
+
+foi encontrado um problema em:
+
+```python
+align_dataframe_to_target_schema(...)
+```
+
+A seleção:
+
+```python
+aligned[ordered_columns]
+```
+
+era entendida pelos stubs do Pandas como podendo resultar em:
+
+```text
+DataFrame
+ou
+Series
+```
+
+embora semanticamente fosse utilizada uma lista de colunas.
+
+A implementação foi alterada para:
+
+```python
+return aligned.reindex(
+    columns=ordered_columns,
+)
+```
+
+## Para que?
+
+Expressar explicitamente que a operação está reorganizando as colunas de um DataFrame.
+
+Depois da correção:
+
+```text
+pyright
+0 errors
+0 warnings
+0 informations
+```
+
+A mudança não altera o comportamento da persistência.
+
+Ela torna o contrato de tipos da função mais explícito.
+
+---
+
+# 45. Adicionar movimentação de arquivos Raw
+
+O módulo:
+
+```text
+bronze/files.py
+```
+
+recebeu:
+
+```python
+move_file(...)
+```
+
+O fluxo passa a poder mover arquivos de:
+
+```text
+raw/inbox
+```
+
+para:
+
+```text
+raw/archive
+```
+
+ou:
+
+```text
+raw/quarantine
+```
+
+## Colisão de nomes
+
+Caso já exista:
+
+```text
+archive/tracker.csv
+```
+
+um novo arquivo não deve sobrescrever o anterior silenciosamente.
+
+Quando um `conflict_suffix` é informado, o nome pode passar a:
+
+```text
+tracker__<batch_id>.csv
+```
+
+## Para que?
+
+Preservar os arquivos físicos recebidos e evitar perda de dados causada por colisão de nomes.
+
+---
+
+# 46. Criar `BronzeLoadResult`
+
+Foi criada:
+
+```python
+@dataclass(frozen=True)
+class BronzeLoadResult:
+```
+
+com campos:
+
+```text
+discovered_file_count
+
+successful_files
+skipped_files
+failed_files
+
+batch_ids
+
+inserted_row_count
+duplicate_row_count
+```
+
+Também foi criada a propriedade:
+
+```python
+@property
+def has_new_data(self) -> bool:
+    return self.inserted_row_count > 0
+```
+
+## O que?
+
+A execução da Bronze deixa de comunicar seu resultado apenas por efeitos colaterais.
+
+Agora ela devolve explicitamente informações sobre o processamento.
+
+Exemplo:
+
+```text
+2 arquivos descobertos
+2 processados
+150 linhas recebidas
+
+145 novas
+5 duplicadas
+```
+
+pode resultar em:
+
+```text
+discovered_file_count = 2
+inserted_row_count = 145
+duplicate_row_count = 5
+has_new_data = True
+```
+
+## Para que?
+
+Criar um contrato entre:
+
+```text
+Bronze
+  ↓
+Pipeline
+  ↓
+Silver
+```
+
+A futura orquestração poderá decidir:
+
+```python
+if not bronze_result.has_new_data:
+    # Silver não precisa ser executada
+```
+
+sem precisar consultar diretamente a Delta Table.
+
+---
+
+# 47. Definir quais `batch_ids` devem ser propagados
+
+`BronzeLoadResult.batch_ids` não contém simplesmente todos os batches executados.
+
+São adicionados apenas batches que realmente inseriram novas linhas:
+
+```python
+if write_result.inserted_row_count > 0:
+    inserted_batch_ids.append(batch_id)
+```
+
+## O que?
+
+Considere:
+
+```text
+batch A
+10 linhas recebidas
+8 inseridas
+2 duplicadas
+```
+
+O batch possui linhas novas na Bronze:
+
+```text
+batch_ids = [A]
+```
+
+Agora:
+
+```text
+batch B
+10 linhas recebidas
+0 inseridas
+10 duplicadas
+```
+
+Nenhuma linha com:
+
+```text
+batch_id = B
+```
+
+foi efetivamente inserida.
+
+Portanto:
+
+```text
+batch_ids
+```
+
+não deve conter `B`.
+
+## Para que?
+
+Evitar que a Silver seja solicitada a processar um batch que não possui nenhuma linha nova na Bronze.
+
+---
+
+# 48. Criar o serviço de ingestão Bronze
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── bronze/
+        └── service.py
+```
+
+Sua principal função é:
+
+```python
+load_bronze_data(...)
+```
+
+Ela recebe explicitamente:
+
+```text
+inbox_dir
+archive_dir
+quarantine_dir
+bronze_dir
+control_dir
+```
+
+## O que?
+
+O serviço passa a coordenar os componentes construídos anteriormente.
+
+O fluxo completo torna-se:
+
+```text
+inbox
+  ↓
+discover_csv_files()
+  ↓
+calculate_file_sha256()
+  ↓
+consultar control table
+  ↓
+arquivo já possui SUCCESS?
+  ├── sim
+  │    ↓
+  │  SKIPPED
+  │    ↓
+  │  archive
+  │
+  └── não
+       ↓
+    PROCESSING
+       ↓
+ validate_input_file()
+       ↓
+    válido?
+   /     \
+ não      sim
+ ↓         ↓
+FAILED   lineage
+ ↓         ↓
+quarantine write Bronze
+             ↓
+          SUCCESS
+             ↓
+           archive
+```
+
+## Para que?
+
+Centralizar **orquestração**, sem trazer novamente todas as responsabilidades para um módulo monolítico.
+
+O serviço chama:
+
+```text
+files.py
+control.py
+validation.py
+lineage.py
+writer.py
+```
+
+mas cada módulo continua responsável pela sua própria lógica.
+
+---
+
+# 49. Tratamento de falhas durante a ingestão
+
+O serviço diferencia falhas por estágio.
+
+## Falha no hash
+
+```text
+arquivo
+ ↓
+SHA-256 falhou
+ ↓
+FAILED
+status_reason = FILE_HASH_ERROR
+ ↓
+quarantine
+```
+
+## Falha de validação
+
+```text
+arquivo
+ ↓
+PROCESSING
+ ↓
+validation
+ ↓
+inválido
+ ↓
+FAILED
+status_reason = VALIDATION_FAILED
+ ↓
+quarantine
+```
+
+## Falha de escrita
+
+```text
+arquivo válido
+ ↓
+lineage
+ ↓
+Delta
+ ↓
+erro
+ ↓
+FAILED
+status_reason = BRONZE_WRITE_FAILED
+ ↓
+quarantine
+```
+
+## Para que?
+
+Permitir identificar em qual estágio a ingestão falhou.
+
+Isso é diferente de registrar apenas:
+
+```text
+FAILED
+```
+
+sem contexto.
+
+---
+
+# 50. Arquivar arquivos processados ou ignorados
+
+O comportamento físico dos arquivos passa a ser:
+
+```text
+SUCCESS
+   ↓
+archive
+
+SKIPPED
+   ↓
+archive
+
+FAILED
+   ↓
+quarantine
+```
+
+## Por que `SKIPPED` vai para archive?
+
+Porque o arquivo não é inválido.
+
+Ele apenas contém dados que já foram processados anteriormente.
+
+Portanto:
+
+```text
+quarantine
+```
+
+não representa corretamente sua situação.
+
+O arquivo já foi analisado e pode sair do `inbox`.
+
+---
+
+# 51. Criar testes de integração da Bronze
+
+Foi criado:
+
+```text
+tests/
+└── integration/
+    └── test_bronze_service.py
+```
+
+Esses testes deixam de verificar apenas funções isoladas.
+
+Eles executam um fluxo vertical utilizando:
+
+```text
+CSV real
+ ↓
+discovery
+ ↓
+hash
+ ↓
+control Delta
+ ↓
+validation
+ ↓
+lineage
+ ↓
+tracker_logs Delta
+ ↓
+archive / quarantine
+```
+
+Entre os cenários cobertos estão:
+
+```text
+arquivo válido é ingerido e arquivado
+arquivo inválido vai para quarantine
+conteúdo previamente processado recebe SKIPPED
+```
+
+## Para que?
+
+Validar que módulos que individualmente já possuem testes também funcionam corretamente quando conectados.
+
+Esse é o primeiro teste da Bronze que exercita praticamente toda a cadeia de ingestão.
+
+---
+
+# 52. Corrigir suposição de ordem física da Delta Table
+
+Os primeiros testes de integração esperavam diretamente:
+
+```python
+control_dataframe["status"].tolist()
+==
+[
+    "PROCESSING",
+    "SUCCESS",
+]
+```
+
+Porém a leitura de uma Delta Table não garante que as linhas sejam retornadas na mesma ordem física das escritas.
+
+Na prática foi observado:
+
+```text
+SUCCESS
+PROCESSING
+```
+
+mesmo que os eventos tivessem sido persistidos na ordem lógica correta.
+
+## Correção
+
+Foi criada uma leitura cronológica:
+
+```python
+def read_control_history(
+    control_dir: Path,
+) -> pd.DataFrame:
+```
+
+que ordena os eventos por:
+
+```text
+recorded_at
+```
+
+antes das asserções.
+
+O teste passa então a verificar:
+
+```text
+ordem temporal
+```
+
+e não:
+
+```text
+ordem física dos arquivos Parquet
+```
+
+## Para que?
+
+Evitar que os testes dependam de uma propriedade que Delta Lake não garante.
+
+---
+
+# 53. Validar a primeira versão integrada da Bronze
+
+Após as correções foram executados:
+
+```powershell
+uv run ruff format .
+uv run ruff check .
+uv run pyright
+uv run pytest
+```
+
+A execução registrada naquele momento resultou em:
+
+```text
+ruff
+→ All checks passed!
+
+pyright
+→ 0 errors
+→ 0 warnings
+→ 0 informations
+
+pytest
+→ 44 testes coletados
+→ 41 passaram inicialmente
+→ 3 falharam apenas pela suposição de ordenação física
+```
+
+Depois da correção da leitura cronológica, os testes de integração deixaram de depender dessa ordenação física.
+
+---
+
+# 54. Expandir `Settings` para a estrutura Raw
+
+O `Settings` foi posteriormente ampliado para representar explicitamente:
+
+```text
+raw_dir
+├── inbox_dir
+├── archive_dir
+└── quarantine_dir
+```
+
+A configuração passa a incluir:
+
+```python
+inbox_dir: Path
+archive_dir: Path
+quarantine_dir: Path
+```
+
+e esses caminhos são derivados de:
+
+```python
+raw_dir = data_dir / "raw"
+```
+
+resultando em:
+
+```text
+QUEO_DATA_DIR
+    │
+    ├── raw
+    │   ├── inbox
+    │   ├── archive
+    │   └── quarantine
+    │
+    └── lakehouse
+        ├── 00_control
+        ├── 01_bronze
+        ├── 02_silver
+        └── 03_gold
+```
+
+## Para que?
+
+Evitar que módulos da aplicação reconstruam manualmente caminhos como:
+
+```python
+settings.raw_dir / "inbox"
+```
+
+Os paths físicos relevantes passam a possuir uma única fonte de definição.
+
+---
+
+# 55. Atualizar os testes de `Settings`
+
+O teste:
+
+```text
+tests/unit/test_settings.py
+```
+
+passou a verificar também:
+
+```text
+inbox_dir
+archive_dir
+quarantine_dir
+```
+
+Além dos diretórios já existentes:
+
+```text
+control_dir
+bronze_dir
+silver_dir
+gold_dir
+```
+
+Foi executado:
+
+```powershell
+uv run pytest tests/unit/test_settings.py
+```
+
+com resultado:
+
+```text
+2 passed
+```
+
+Também foram executados:
+
+```text
+ruff       → OK
+pyright    → OK
+```
+
+## Para que?
+
+Confirmar que toda a árvore de diretórios continua derivada corretamente de:
+
+```text
+QUEO_DATA_DIR
+```
+
+e não apenas os diretórios do Lakehouse.
+
+---
+
+# 56. Criar uma interface de alto nível para a Bronze
+
+Além de:
+
+```python
+load_bronze_data(...)
+```
+
+foi criada uma interface baseada em configuração:
+
+```python
+load_bronze(
+    settings: Settings,
+) -> BronzeLoadResult:
+```
+
+Internamente ela delega para:
+
+```python
+load_bronze_data(
+    inbox_dir=settings.inbox_dir,
+    archive_dir=settings.archive_dir,
+    quarantine_dir=settings.quarantine_dir,
+    bronze_dir=settings.bronze_dir,
+    control_dir=settings.control_dir,
+)
+```
+
+## O que?
+
+Passam a existir dois níveis de chamada.
+
+### Interface explícita
+
+```python
+load_bronze_data(...)
+```
+
+Recebe os caminhos individualmente.
+
+É especialmente útil para:
+
+```text
+testes
+execuções isoladas
+injeção de diretórios temporários
+```
+
+### Interface da plataforma
+
+```python
+load_bronze(settings)
+```
+
+Recebe a configuração completa.
+
+É a interface que poderá ser utilizada pela futura orquestração.
+
+## Para que?
+
+Evitar que o pipeline precise conhecer todos os detalhes de localização física usados pela Bronze.
+
+Em vez de:
+
+```python
+load_bronze_data(
+    inbox_dir=settings.inbox_dir,
+    archive_dir=settings.archive_dir,
+    quarantine_dir=settings.quarantine_dir,
+    bronze_dir=settings.bronze_dir,
+    control_dir=settings.control_dir,
+)
+```
+
+o pipeline poderá utilizar:
+
+```python
+load_bronze(settings)
+```
+
+---
+
+# 57. Validar a Bronze através de `Settings`
+
+Foi adicionado um cenário de integração que executa:
+
+```text
+QUEO_DATA_DIR temporário
+       ↓
+load_settings()
+       ↓
+Settings
+       ↓
+load_bronze(settings)
+       ↓
+ingestão real
+```
+
+O teste verifica que a execução produz:
+
+```text
+archive/tracker.csv
+01_bronze/tracker_logs
+00_control/ingestion_files
+```
+
+e retorna:
+
+```text
+has_new_data = True
+inserted_row_count = 1
+```
+
+Após a inclusão dos cenários finais, a execução isolada de:
+
+```powershell
+uv run pytest tests/integration/test_bronze_service.py
+```
+
+registrou:
+
+```text
+6 testes coletados
+6 testes aprovados
+```
+
+Também foi registrado:
+
+```text
+pyright
+0 errors
+0 warnings
+0 informations
+```
+
+---
+
+# 58. Estado da camada Bronze após a integração
+
+A arquitetura da Bronze passa a ser:
+
+```text
+                       Settings
+                          │
+                          ▼
+                    load_bronze()
+                          │
+                          ▼
+                 load_bronze_data()
+                          │
+          ┌───────────────┼────────────────┐
+          │               │                │
+          ▼               ▼                ▼
+       files.py       control.py     validation.py
+          │               │                │
+          └──────────┐    │    ┌───────────┘
+                     ▼    ▼    ▼
+                      lineage.py
+                          │
+                          ▼
+                       writer.py
+                          │
+                          ▼
+                 01_bronze/tracker_logs
+                          │
+                          ▼
+                  BronzeLoadResult
+                          │
+                ┌─────────┴─────────┐
+                ▼                   ▼
+          has_new_data           batch_ids
+                │                   │
+                └─────────┬─────────┘
+                          ▼
+                   futura Silver
+```
+
+Fisicamente, o fluxo completo é:
+
+```text
+data/raw/inbox
+       │
+       ▼
+ descoberta de CSV
+       │
+       ▼
+      SHA-256
+       │
+       ▼
+00_control/ingestion_files
+       │
+       ├── hash já processado
+       │       ↓
+       │    SKIPPED
+       │       ↓
+       │    archive
+       │
+       └── novo conteúdo
+               ↓
+           PROCESSING
+               ↓
+           validation
+             /     \
+            /       \
+        inválido    válido
+           ↓          ↓
+        FAILED      lineage
+           ↓          ↓
+      quarantine    MERGE
+                      ↓
+                   SUCCESS
+                      ↓
+                   archive
+```
+
+---
+
+# 59. Responsabilidades finais dos módulos Bronze
+
+Ao final dessa fase, a camada está dividida em responsabilidades explícitas.
+
+## `files.py`
+
+Responsável por:
+
+```text
+descoberta de CSV
+SHA-256
+movimentação de arquivos
+```
+
+## `validation.py`
+
+Responsável por:
+
+```text
+leitura CSV
+encoding
+normalização de colunas
+colunas obrigatórias
+colunas reservadas
+duplicidade de nomes
+resultado de validação
+```
+
+## `lineage.py`
+
+Responsável por:
+
+```text
+batch_id
+row_id
+source_file
+source_file_hash
+source_row_number
+ingested_at
+ingestion_date
+```
+
+## `writer.py`
+
+Responsável por:
+
+```text
+PyArrow
+CREATE
+MERGE insert-only
+schema alignment
+schema evolution
+BronzeWriteResult
+```
+
+## `control.py`
+
+Responsável por:
+
+```text
+ingestion_files
+eventos operacionais
+PROCESSING
+SUCCESS
+FAILED
+SKIPPED
+histórico append-only
+detecção de hashes já processados
+```
+
+## `service.py`
+
+Responsável por:
+
+```text
+orquestrar as operações anteriores
+archive
+quarantine
+BronzeLoadResult
+```
+
+Essa divisão evita voltar à estrutura de um único arquivo responsável por toda a camada.
+
+---
+
+# 60. Resultado da Bronze v1
+
+Ao final dessa etapa, a plataforma possui:
+
+```text
+Raw
+├── inbox
+├── archive
+└── quarantine
+
+Control
+└── ingestion_files
+    ├── PROCESSING
+    ├── SUCCESS
+    ├── FAILED
+    └── SKIPPED
+
+Bronze
+└── tracker_logs
+    ├── lineage
+    ├── ingestion_date
+    ├── CREATE inicial
+    ├── MERGE insert-only
+    ├── idempotência por row_id
+    └── evolução de schema
+```
+
+A sequência lógica implementada é:
+
+```text
+arquivo recebido
+      ↓
+descoberta
+      ↓
+hash
+      ↓
+controle de idempotência
+      ↓
+validação
+      ↓
+lineage
+      ↓
+persistência Delta
+      ↓
+controle operacional
+      ↓
+archive / quarantine
+```
+
+O resultado da camada é exposto por:
+
+```python
+BronzeLoadResult
+```
+
+permitindo que as próximas etapas da plataforma consumam:
+
+```text
+has_new_data
+batch_ids
+inserted_row_count
+duplicate_row_count
+```
+
+sem precisar conhecer detalhes internos da ingestão.
+
+---
+
+# 61. Próxima etapa planejada
+
+Com a Bronze isolada e funcional, a próxima camada passa a ser:
+
+```text
+Silver
+```
+
+A primeira evolução não deve começar diretamente pela implementação das transformações.
+
+Antes é necessário definir os contratos dos produtos Silver:
+
+```text
+telemetry_events
+device_identity_events
+rejected_logs
+```
+
+e estabelecer quais metadados precisam atravessar:
+
+```text
+Bronze
+   ↓
+Silver
+```
+
+especialmente:
+
+```text
+row_id
+batch_id
+source_file
+source_file_hash
+source_row_number
+ingested_at
+```
+
+A nova etapa deverá preservar a estratégia seguida até aqui:
+
+```text
+definir contrato
+    ↓
+implementar comportamento isolado
+    ↓
+testar
+    ↓
+integrar
+    ↓
+somente então orquestrar
+```
 
