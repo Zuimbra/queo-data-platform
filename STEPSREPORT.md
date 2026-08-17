@@ -3484,3 +3484,1867 @@ integrar
 somente então orquestrar
 ```
 
+# 62. Definir os contratos da camada Silver
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── contracts/
+        └── silver.py
+```
+
+## O que?
+
+O desenvolvimento da Silver começou pela formalização do contrato da camada, antes da implementação das transformações.
+
+Foram definidos os três produtos Silver:
+
+```text
+telemetry_events
+device_identity_events
+rejected_logs
+```
+
+Também foram definidas suas respectivas colunas de particionamento:
+
+```text
+telemetry_events
+→ event_date
+
+device_identity_events
+→ event_date
+
+rejected_logs
+→ rejection_date
+```
+
+Outro ponto formalizado foi a preservação da linhagem criada na Bronze.
+
+Foi definido:
+
+```python
+SILVER_LINEAGE_COLUMNS = BRONZE_METADATA_COLUMNS
+```
+
+Com isso, os produtos Silver devem continuar carregando:
+
+```text
+source_file
+source_file_hash
+source_row_number
+row_id
+batch_id
+ingested_at
+ingestion_date
+```
+
+## Para que?
+
+Evitar que cada parte da Silver passe a definir nomes de tabelas, colunas de partição ou campos de lineage de maneira independente.
+
+A relação entre contratos passa a ser:
+
+```text
+contracts/tracker.py
+        │
+        │ BRONZE_METADATA_COLUMNS
+        ▼
+contracts/silver.py
+        │
+        ├── telemetry_events
+        ├── device_identity_events
+        └── rejected_logs
+```
+
+A Silver pode interpretar e transformar campos de negócio, mas a identidade da linha originalmente ingerida deve permanecer rastreável.
+
+## Como?
+
+Foram criadas constantes como:
+
+```python
+TELEMETRY_TABLE_NAME = "telemetry_events"
+
+DEVICE_IDENTITY_TABLE_NAME = "device_identity_events"
+
+REJECTED_LOGS_TABLE_NAME = "rejected_logs"
+
+SILVER_EVENT_PARTITION_COLUMN = "event_date"
+
+SILVER_REJECTION_PARTITION_COLUMN = "rejection_date"
+```
+
+Também foram adicionados testes para validar:
+
+```text
+nomes das tabelas
+colunas de partição
+preservação do contrato de lineage
+```
+
+Após essa etapa:
+
+```text
+pytest
+→ 50 testes aprovados
+```
+
+### Commit
+
+```text
+feat: define silver data contracts
+```
+
+---
+
+# 63. Adicionar DuckDB e criar a normalização comum da Silver
+
+Foi adicionada a dependência:
+
+```powershell
+uv add duckdb
+```
+
+E criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        └── normalization.py
+```
+
+## O que?
+
+A Silver passou a possuir uma primeira etapa de transformação comum antes da classificação dos registros.
+
+O objetivo dessa etapa é converter a representação da Bronze em uma representação intermediária consistente.
+
+O fluxo passa a ser:
+
+```text
+01_bronze/tracker_logs
+        ↓
+normalize_bronze_dataframe()
+        ↓
+representação Silver normalizada
+```
+
+Nesse ponto ainda não existe separação entre:
+
+```text
+telemetry
+identity
+rejected
+```
+
+A função apenas prepara os dados para as etapas seguintes.
+
+## Para que?
+
+Separar:
+
+```text
+limpeza
++
+normalização
++
+tipagem básica
+```
+
+de:
+
+```text
+classificação
++
+regra de negócio
+```
+
+Sem essa separação, a tendência seria reconstruir um módulo Silver monolítico contendo:
+
+```text
+leitura
+normalização
+classificação
+transformação
+persistência
+incrementalidade
+```
+
+em uma única função.
+
+A nova estrutura permite que cada etapa seja compreendida e testada isoladamente.
+
+## Como?
+
+Foi criado um mapeamento declarativo de colunas da Bronze para nomes utilizados internamente pela Silver.
+
+Exemplos:
+
+```text
+TIPO_LOG
+→ log_type
+
+MESS_TYPE
+→ message_type
+
+LAT
+→ latitude_raw
+
+LONT
+→ longitude_raw
+
+SPEED
+→ speed_raw
+```
+
+Os campos textuais passam por operações equivalentes a:
+
+```sql
+TRIM
++
+NULLIF(..., '')
+```
+
+Portanto:
+
+```text
+"   T2   "
+→ "T2"
+```
+
+e:
+
+```text
+"   "
+→ NULL
+```
+
+Os timestamps são convertidos com `TRY_CAST`:
+
+```text
+DATA_SERVIDOR
+→ server_timestamp
+
+TM_STAMP
+→ device_timestamp
+```
+
+Um timestamp inválido não interrompe o processamento:
+
+```text
+"invalid-timestamp"
+→ NULL
+```
+
+A etapa também preserva os campos de lineage recebidos da Bronze.
+
+---
+
+## Decisão importante sobre campos do protocolo
+
+Nesta etapa, campos como:
+
+```text
+BAT_VOLT
+LAT
+LONT
+```
+
+continuam sendo mantidos como texto:
+
+```text
+battery_voltage_raw
+latitude_raw
+longitude_raw
+```
+
+Isso ocorre porque mensagens do tipo:
+
+```text
+T1
+```
+
+reutilizam essas posições do protocolo para transportar identificadores.
+
+Assim:
+
+```text
+BAT_VOLT
+LAT
+LONT
+```
+
+não significam necessariamente:
+
+```text
+bateria
+latitude
+longitude
+```
+
+até que o tipo da mensagem seja conhecido.
+
+Converter esses valores para número antes da classificação poderia destruir informação válida de mensagens de identidade.
+
+## Testes
+
+Foram cobertos:
+
+```text
+coluna Bronze obrigatória ausente
+trim de campos textuais
+string vazia → NULL
+timestamp válido
+timestamp inválido → NULL
+campos de protocolo preservados como texto
+lineage preservado
+```
+
+Após essa etapa:
+
+```text
+pytest
+→ 57 testes aprovados
+```
+
+### Commit
+
+```text
+feat: add silver bronze normalization
+```
+
+---
+
+# 64. Criar a classificação dos registros Silver
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        └── classification.py
+```
+
+## O que?
+
+Depois da normalização, a Silver passa a determinar a natureza de cada registro.
+
+Foi criada:
+
+```python
+SilverClassificationResult
+```
+
+contendo três conjuntos:
+
+```text
+telemetry
+identity
+rejected
+```
+
+O fluxo passa a ser:
+
+```text
+normalized
+    │
+    ▼
+classification
+    │
+    ├── telemetry
+    ├── identity
+    └── rejected
+```
+
+## Para que?
+
+Separar a pergunta:
+
+```text
+"para onde esta linha deve ir?"
+```
+
+da pergunta:
+
+```text
+"como os campos desse tipo de registro devem ser interpretados?"
+```
+
+Assim:
+
+```text
+classification.py
+→ decide o domínio
+
+transformation.py
+→ interpreta os campos daquele domínio
+```
+
+---
+
+## Como?
+
+Foi criado:
+
+```text
+event_timestamp
+```
+
+seguindo a prioridade:
+
+```text
+device_timestamp
+      ↓ se ausente
+server_timestamp
+```
+
+Conceitualmente:
+
+```sql
+COALESCE(
+    device_timestamp,
+    server_timestamp
+)
+```
+
+A classificação do `message_type` segue:
+
+```text
+T1
+→ identidade
+
+T2, T3, T4, ...
+→ telemetria
+```
+
+O formato aceito para mensagens de protocolo é:
+
+```text
+^T[0-9]+$
+```
+
+---
+
+## Rejeições
+
+Foram formalizados os principais motivos de rejeição:
+
+```text
+MISSING_MESSAGE_TYPE
+INVALID_MESSAGE_TYPE
+MISSING_OR_INVALID_TIMESTAMP
+MISSING_DEVICE_SERIAL
+```
+
+Assim, um registro inválido não é simplesmente descartado.
+
+Ele passa a carregar:
+
+```text
+rejection_reason
+```
+
+permitindo auditoria posterior.
+
+---
+
+## Partição `unknown`
+
+Quando:
+
+```text
+device_timestamp = NULL
+server_timestamp = NULL
+```
+
+não existe uma data válida que possa ser usada para particionamento.
+
+Nesse caso:
+
+```text
+rejection_date = "unknown"
+```
+
+O registro continua persistível e auditável mesmo sem referência temporal válida.
+
+---
+
+## Exclusividade da classificação
+
+Cada registro deve terminar em apenas um destino:
+
+```text
+                    normalized
+                        │
+              ┌─────────┴─────────┐
+              │                   │
+         rejection?              não
+              │                   │
+              ▼            ┌──────┴──────┐
+          rejected         │             │
+                          T1           T<n> ≠ T1
+                           │             │
+                           ▼             ▼
+                       identity      telemetry
+```
+
+Uma linha não pode simultaneamente pertencer a:
+
+```text
+telemetry
++
+rejected
+```
+
+por exemplo.
+
+## Testes
+
+Foram adicionados testes para:
+
+```text
+T2 → telemetry
+T1 → identity
+message_type ausente
+message_type inválido
+timestamps ausentes
+serial ausente
+prioridade de device_timestamp
+fallback para server_timestamp
+contrato mínimo da entrada
+```
+
+### Commit
+
+```text
+feat: add silver event classification
+```
+
+---
+
+# 65. Criar as transformações tipadas dos produtos Silver
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        └── transformation.py
+```
+
+## O que?
+
+Depois que os registros são classificados, os candidatos passam pelas transformações específicas de cada produto Silver.
+
+Foram criadas:
+
+```python
+transform_telemetry_dataframe(...)
+```
+
+e:
+
+```python
+transform_identity_dataframe(...)
+```
+
+O fluxo passa a ser:
+
+```text
+normalization
+    ↓
+classification
+    ↓
+transformation
+```
+
+## Para que?
+
+Evitar que a classificação também precise conhecer todos os detalhes do protocolo de telemetria e identidade.
+
+A classificação determina:
+
+```text
+qual é o tipo do registro?
+```
+
+A transformação determina:
+
+```text
+como os campos desse tipo devem ser interpretados?
+```
+
+---
+
+## Transformação da telemetria
+
+Campos mantidos como texto durante a normalização passam agora por conversões seguras.
+
+Exemplos:
+
+```text
+latitude_raw
+→ latitude
+
+longitude_raw
+→ longitude
+
+speed_raw
+→ speed
+
+hdop_raw
+→ hdop
+
+rpm_raw
+→ rpm
+
+serial_count_raw
+→ serial_count
+```
+
+As conversões utilizam:
+
+```text
+TRY_CAST
+```
+
+Portanto:
+
+```text
+"45.5"
+→ 45.5
+```
+
+enquanto:
+
+```text
+"invalid"
+→ NULL
+```
+
+Um valor individual inválido não elimina todo o registro.
+
+---
+
+## Serial do dispositivo
+
+O prefixo:
+
+```text
+M
+```
+
+é removido de:
+
+```text
+device_serial_raw
+```
+
+para gerar:
+
+```text
+device_serial
+```
+
+Exemplo:
+
+```text
+M123456789
+→ 123456789
+```
+
+---
+
+## Qualidade de posição
+
+Foram criados:
+
+```text
+has_valid_coordinates
+position_quality
+```
+
+As coordenadas são consideradas válidas quando:
+
+```text
+-90 <= latitude <= 90
+
+-180 <= longitude <= 180
+```
+
+`position_quality` pode assumir:
+
+```text
+MISSING_COORDINATES
+INVALID_COORDINATES
+LOW_GPS_PRECISION
+VALID
+```
+
+Quando:
+
+```text
+HDOP > 5
+```
+
+a posição recebe:
+
+```text
+LOW_GPS_PRECISION
+```
+
+### Decisão de regra de negócio
+
+Coordenadas inválidas não enviam automaticamente o evento para:
+
+```text
+rejected_logs
+```
+
+O registro continua sendo um evento de telemetria.
+
+A qualidade do posicionamento é registrada separadamente.
+
+Isso distingue:
+
+```text
+registro estruturalmente inválido
+```
+
+de:
+
+```text
+evento válido com posição ruim
+```
+
+---
+
+## Transformação das mensagens de identidade
+
+Mensagens:
+
+```text
+T1
+```
+
+reutilizam posições do protocolo para transportar identificadores.
+
+A transformação interpreta:
+
+```text
+battery_voltage_raw
+→ iccid
+
+latitude_raw
+→ imsi
+
+longitude_raw
+→ imei
+```
+
+Também foram criados:
+
+```text
+has_valid_iccid_format
+has_valid_imsi_format
+has_valid_imei_format
+```
+
+As regras utilizadas são:
+
+```text
+ICCID
+→ 18 a 22 dígitos
+
+IMSI
+→ 14 a 16 dígitos
+
+IMEI
+→ exatamente 15 dígitos
+```
+
+## Testes
+
+Foram testados:
+
+```text
+tipagem numérica
+valor numérico inválido → NULL
+remoção do prefixo M
+coordenadas válidas
+coordenadas ausentes
+coordenadas inválidas
+HDOP alto
+extração de ICCID
+extração de IMSI
+extração de IMEI
+formatos válidos de identidade
+formatos inválidos de identidade
+preservação de lineage
+```
+
+### Commit
+
+```text
+feat: add silver product transformations
+```
+
+---
+
+# 66. Formalizar os schemas PyArrow da Silver
+
+O arquivo:
+
+```text
+src/queo_data_platform/contracts/silver.py
+```
+
+foi expandido.
+
+Foram criados schemas explícitos para:
+
+```text
+TELEMETRY_SCHEMA
+DEVICE_IDENTITY_SCHEMA
+REJECTED_LOGS_SCHEMA
+```
+
+## O que?
+
+A Silver deixa de depender apenas da inferência automática de tipos de Pandas e Arrow.
+
+Cada produto passa a possuir um contrato físico explícito.
+
+Exemplos:
+
+```text
+event_date
+→ string
+
+latitude
+→ float64
+
+serial_count
+→ int64
+
+has_valid_coordinates
+→ bool
+
+source_row_number
+→ int64
+
+ingested_at
+→ timestamp UTC
+```
+
+## Para que?
+
+Garantir estabilidade de schema inclusive quando uma tabela ou coluna está vazia.
+
+Sem schema explícito:
+
+```text
+coluna possui apenas NULL
+        ↓
+Arrow tenta inferir
+        ↓
+NullType
+```
+
+Depois, quando chega:
+
+```text
+"TRACKER"
+```
+
+ou outro valor real, o tipo persistido anteriormente pode ser incompatível.
+
+Com schema explícito:
+
+```text
+NULL
+NULL
+NULL
+```
+
+pode continuar tendo contrato:
+
+```text
+string
+```
+
+por exemplo.
+
+Isso é especialmente importante para:
+
+```text
+rejected_logs
+```
+
+que pode inicialmente não possuir nenhuma linha.
+
+---
+
+# 67. Criar persistência Delta da Silver
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        └── writer.py
+```
+
+## O que?
+
+A Silver passa a possuir um módulo exclusivamente responsável pela fronteira:
+
+```text
+DataFrame
+   ↓
+PyArrow
+   ↓
+Delta Lake
+```
+
+Foram implementadas operações para:
+
+```text
+conversão para Arrow
+rebuild completo
+replace seletivo por partição
+remoção de partições que ficaram vazias
+```
+
+---
+
+## `dataframe_to_arrow()`
+
+A função:
+
+```python
+dataframe_to_arrow(...)
+```
+
+recebe:
+
+```text
+DataFrame
++
+schema explícito
+```
+
+e:
+
+1. valida se todas as colunas necessárias existem;
+2. reorganiza as colunas segundo o contrato;
+3. cria uma `pa.Table` utilizando o schema Silver.
+
+O fluxo é:
+
+```text
+DataFrame
+    ↓
+Silver Schema
+    ↓
+PyArrow Table
+    ↓
+Delta Lake
+```
+
+---
+
+## Rebuild completo
+
+Foi criada:
+
+```python
+write_full_silver_table(...)
+```
+
+A escrita utiliza:
+
+```text
+mode="overwrite"
+schema_mode="overwrite"
+partition_by=[...]
+```
+
+Esse caminho permite reconstruir completamente um produto Silver.
+
+---
+
+## Replace seletivo por partição
+
+Foi criada:
+
+```python
+write_incremental_silver_partitions(...)
+```
+
+Essa função recebe explicitamente:
+
+```text
+affected_partitions
+```
+
+e substitui somente essas partições.
+
+Exemplo:
+
+```text
+telemetry_events
+
+16/08
+17/08
+18/08
+```
+
+Se apenas:
+
+```text
+17/08
+```
+
+foi afetado:
+
+```text
+16/08 → permanece
+17/08 → reconstruído
+18/08 → permanece
+```
+
+A substituição utiliza:
+
+```python
+write_deltalake(
+    ...,
+    mode="overwrite",
+    predicate=predicate,
+)
+```
+
+com predicates equivalentes a:
+
+```text
+event_date = '2026-08-17'
+```
+
+ou:
+
+```text
+rejection_date = 'unknown'
+```
+
+---
+
+## Partição afetada que ficou vazia
+
+Também foi tratado o caso:
+
+```text
+partição antiga
+→ possuía registros
+
+reprocessamento
+→ novo resultado = zero registros
+```
+
+Apenas deixar de escrever a partição não seria suficiente.
+
+Os registros antigos continuariam existindo.
+
+Nesse cenário é executado:
+
+```python
+delta_table.delete(predicate)
+```
+
+Assim:
+
+```text
+estado recalculado da partição = vazio
+```
+
+realmente resulta em:
+
+```text
+partição sem registros
+```
+
+---
+
+## Preservação de schema
+
+A conversão para Arrow utiliza schemas explícitos.
+
+Isso evita que:
+
+```text
+resultado vazio
+```
+
+ou:
+
+```text
+coluna com somente NULL
+```
+
+cause mudanças indesejadas no schema Delta.
+
+---
+
+## Ajuste de tipagem PyArrow / Pyright
+
+Inicialmente o filtro vetorizado utilizava:
+
+```python
+pc.equal(...)
+```
+
+A operação funcionava em runtime, mas os stubs utilizados pelo Pyright não reconheciam esse atributo.
+
+A implementação foi ajustada para:
+
+```python
+pc.call_function("equal", ...)
+```
+
+A operação continua executada no Arrow, sem:
+
+```text
+converter para Pandas
+```
+
+e sem:
+
+```text
+ignorar o type checker
+```
+
+## Testes
+
+Foram adicionados testes para:
+
+```text
+schema string preservado quando valor = NULL
+rebuild completo cria Delta Table particionada
+replace altera somente a partição afetada
+partição vazia remove registros antigos
+colunas de partição permanecem string
+```
+
+A suíte registrada após essa fase chegou a:
+
+```text
+pytest
+→ 82 testes aprovados
+```
+
+Também foram validados:
+
+```text
+ruff
+pyright
+pytest
+```
+
+### Commit
+
+```text
+feat: add silver delta persistence
+```
+
+---
+
+# 68. Estrutura modular da Silver até a persistência
+
+Neste ponto a Silver possui:
+
+```text
+src/queo_data_platform/silver/
+│
+├── normalization.py
+├── classification.py
+├── transformation.py
+└── writer.py
+```
+
+Além do contrato:
+
+```text
+src/queo_data_platform/contracts/silver.py
+```
+
+O fluxo construído é:
+
+```text
+01_bronze/tracker_logs
+        │
+        ▼
+normalization.py
+        │
+        │ limpeza
+        │ timestamps
+        │ representação raw
+        │ lineage
+        ▼
+classification.py
+        │
+        ├── telemetry
+        ├── identity
+        └── rejected
+        │
+        ▼
+transformation.py
+        │
+        ├── telemetria tipada
+        └── identidade tipada
+        │
+        ▼
+schemas PyArrow
+        │
+        ▼
+writer.py
+        │
+        ├── telemetry_events
+        ├── device_identity_events
+        └── rejected_logs
+```
+
+A principal diferença em relação à POC é estrutural.
+
+Em vez de concentrar:
+
+```text
+normalização
+classificação
+transformação
+persistência
+incrementalidade
+```
+
+em um único módulo extenso, cada responsabilidade passa a possuir uma fronteira própria.
+
+---
+
+# 69. Iniciar incrementalidade Silver por `batch_id`
+
+O próximo componente iniciado é:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        └── incremental.py
+```
+
+## O que?
+
+A incrementalidade da Silver passa a ser desenhada em torno dos:
+
+```text
+batch_ids
+```
+
+produzidos pela Bronze.
+
+A intenção não é reprocessar diretamente:
+
+```text
+WHERE batch_id IN (...)
+```
+
+como resultado final.
+
+Os batches servem para descobrir:
+
+```text
+quais partições foram afetadas?
+```
+
+---
+
+## Estrutura principal
+
+Foi definida:
+
+```python
+SilverAffectedPartitions
+```
+
+contendo:
+
+```text
+event_dates
+rejection_dates
+```
+
+e propriedades:
+
+```text
+include_unknown
+is_empty
+```
+
+Também foram definidas funções para:
+
+```text
+normalize_batch_ids(...)
+discover_affected_partitions(...)
+load_incremental_bronze_scope(...)
+```
+
+---
+
+## `normalize_batch_ids()`
+
+A função recebe coleções como:
+
+```text
+list
+set
+tuple
+None
+```
+
+e produz uma coleção canônica:
+
+```text
+sem valores vazios
+sem duplicatas
+ordenada
+```
+
+Exemplo:
+
+```text
+[
+    " batch-002 ",
+    "batch-001",
+    "batch-002",
+    ""
+]
+```
+
+resulta em:
+
+```text
+(
+    "batch-001",
+    "batch-002"
+)
+```
+
+---
+
+## Descoberta das partições afetadas
+
+A função:
+
+```python
+discover_affected_partitions(...)
+```
+
+consulta a Bronze para encontrar os timestamps pertencentes aos batches novos.
+
+Para cada linha é utilizado:
+
+```text
+TM_STAMP
+      ↓ fallback
+DATA_SERVIDOR
+```
+
+equivalente a:
+
+```sql
+COALESCE(
+    TRY_CAST(TM_STAMP AS TIMESTAMP),
+    TRY_CAST(DATA_SERVIDOR AS TIMESTAMP)
+)
+```
+
+As datas encontradas passam a compor:
+
+```text
+event_dates
+```
+
+e também podem afetar:
+
+```text
+rejection_dates
+```
+
+---
+
+## Regra fundamental da incrementalidade
+
+Os `batch_ids` são utilizados apenas para descobrir quais datas mudaram.
+
+Eles não devem limitar o conjunto final utilizado para reconstruir uma partição.
+
+Considere:
+
+```text
+batch antigo
+│
+└── row A
+    event_date = 17/08
+```
+
+Depois chega:
+
+```text
+batch novo
+│
+└── row B
+    event_date = 17/08
+```
+
+O batch novo informa:
+
+```text
+17/08 foi afetado
+```
+
+Mas o rebuild de:
+
+```text
+17/08
+```
+
+deve utilizar:
+
+```text
+row A
++
+row B
+```
+
+e não apenas:
+
+```text
+row B
+```
+
+O fluxo correto é:
+
+```text
+batch novo
+    ↓
+descobrir datas afetadas
+    ↓
+17/08
+    ↓
+recarregar TODA a Bronze de 17/08
+    ↓
+normalização
+    ↓
+classificação
+    ↓
+transformação
+    ↓
+replace completo da partição 17/08
+```
+
+Essa decisão é necessária para suportar corretamente:
+
+```text
+late-arriving data
+```
+
+---
+
+## Late-arriving data
+
+Late-arriving data representa o caso em que um evento chega posteriormente, mas pertence a uma data já processada.
+
+Exemplo:
+
+```text
+18/08
+chega evento cujo timestamp = 17/08
+```
+
+A Silver não deve:
+
+```text
+append isoladamente o novo evento
+```
+
+nem:
+
+```text
+substituir 17/08 usando apenas o batch novo
+```
+
+Ela deve:
+
+```text
+descobrir que 17/08 mudou
+        ↓
+reler toda a Bronze de 17/08
+        ↓
+reconstruir a partição Silver
+```
+
+Assim o estado final continua completo e idempotente.
+
+---
+
+## Partição `unknown`
+
+Existe também o caso em que:
+
+```text
+TM_STAMP inválido
++
+DATA_SERVIDOR inválido
+```
+
+ou ambos ausentes.
+
+Esse registro não possui:
+
+```text
+event_date
+```
+
+e deve chegar a:
+
+```text
+rejected_logs
+```
+
+usando:
+
+```text
+rejection_date = "unknown"
+```
+
+Quando um batch novo contém um registro desse tipo:
+
+```text
+unknown
+```
+
+torna-se uma partição afetada.
+
+Nesse caso, o rebuild deve carregar:
+
+```text
+todos os registros Bronze sem timestamp válido
+```
+
+e não somente os registros do batch novo.
+
+O comportamento é análogo ao late-arriving data:
+
+```text
+batch novo
+    ↓
+descobre unknown afetado
+    ↓
+recarrega todo o universo Bronze sem timestamp válido
+    ↓
+reconstrói rejected_logs/unknown
+```
+
+---
+
+## Testes planejados para `incremental.py`
+
+Foram definidos testes para validar:
+
+```text
+normalização de batch_ids
+batch vazio → nenhuma partição
+descoberta de event_date
+timestamp inválido → unknown
+late-arriving data → scope completo da data
+unknown → todos os registros sem timestamp
+```
+
+O teste mais importante é conceitualmente:
+
+```text
+Bronze
+
+row-old
+batch-old
+17/08
+
+row-late
+batch-new
+17/08
+
+row-other
+batch-other
+18/08
+```
+
+Ao processar:
+
+```text
+batch-new
+```
+
+o scope esperado é:
+
+```text
+row-old
+row-late
+```
+
+e não:
+
+```text
+row-late
+```
+
+Também não deve incluir:
+
+```text
+row-other
+```
+
+---
+
+## Estado desta etapa
+
+Neste ponto:
+
+```text
+contratos Silver            ✅
+normalização                ✅
+classificação               ✅
+transformações tipadas      ✅
+schemas PyArrow             ✅
+persistência Delta          ✅
+
+incrementalidade por batch  ◐ em implementação/validação
+silver/service.py           ⏳ ainda não iniciado
+```
+
+A incrementalidade ainda não deve ser considerada concluída no relatório até executar:
+
+```powershell
+uv run ruff format .
+uv run ruff check .
+uv run pyright
+uv run pytest
+```
+
+e confirmar os testes do novo:
+
+```text
+silver/incremental.py
+```
+
+O commit previsto, depois da validação, é:
+
+```text
+feat: add silver incremental partition discovery
+```
+
+---
+
+# 70. Estado atual da arquitetura
+
+O projeto chegou ao seguinte ponto:
+
+```text
+                         QUEO DATA PLATFORM
+
+
+Raw
+│
+├── inbox
+├── archive
+└── quarantine
+        │
+        ▼
+Bronze
+│
+├── files.py
+├── validation.py
+├── lineage.py
+├── control.py
+├── writer.py
+└── service.py
+        │
+        ▼
+01_bronze/tracker_logs
+        │
+        ▼
+BronzeLoadResult
+        │
+        │ batch_ids
+        ▼
+Silver
+│
+├── contracts/silver.py
+├── normalization.py
+├── classification.py
+├── transformation.py
+├── writer.py
+└── incremental.py        ← etapa atual
+        │
+        ▼
+02_silver/
+│
+├── telemetry_events
+├── device_identity_events
+└── rejected_logs
+```
+
+A Bronze já funciona como uma camada integrada:
+
+```text
+inbox
+  ↓
+discovery
+  ↓
+hash
+  ↓
+validation
+  ↓
+lineage
+  ↓
+control
+  ↓
+Delta MERGE
+  ↓
+archive / quarantine
+  ↓
+BronzeLoadResult
+```
+
+A Silver já possui suas principais peças isoladas:
+
+```text
+normalization
+classification
+transformation
+schemas
+writer
+incremental scope
+```
+
+mas ainda não possui:
+
+```text
+silver/service.py
+```
+
+Portanto, a Silver ainda não deve ser tratada como uma camada integrada concluída.
+
+O próximo grande passo, depois da validação da incrementalidade, será criar:
+
+```text
+src/queo_data_platform/silver/service.py
+```
+
+responsável por coordenar:
+
+```text
+Bronze Delta
+    ↓
+batch_ids
+    ↓
+affected partitions
+    ↓
+Bronze scope
+    ↓
+normalization
+    ↓
+classification
+    ↓
+transformations
+    ↓
+schemas PyArrow
+    ↓
+Delta writer
+    ↓
+SilverLoadResult
+```
+
+O `SilverLoadResult` será a futura interface entre:
+
+```text
+Silver
+↓
+Gold
+```
+
+da mesma forma que:
+
+```text
+BronzeLoadResult
+```
+
+já formaliza a interface entre:
+
+```text
+Bronze
+↓
+Silver
+```
+
+---
+
+# 71. Próximo passo previsto
+
+Antes de iniciar:
+
+```text
+silver/service.py
+```
+
+deve ser concluída e validada a incrementalidade implementada em:
+
+```text
+silver/incremental.py
+```
+
+A validação esperada é:
+
+```powershell
+uv run ruff format .
+uv run ruff check .
+uv run pyright
+uv run pytest
+```
+
+Somente depois dos checks verdes deverá ser realizado:
+
+```text
+feat: add silver incremental partition discovery
+```
+
+A sequência planejada passa a ser:
+
+```text
+incremental.py
+    ↓
+testes verdes
+    ↓
+commit
+    ↓
+silver/service.py
+    ↓
+SilverLoadResult
+    ↓
+teste integrado da Silver
+    ↓
+fechamento da Silver v1
+```
+
