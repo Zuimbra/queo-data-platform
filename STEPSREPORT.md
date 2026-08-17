@@ -6534,9 +6534,7 @@ foi ajustada.
 O fluxo sempre executava:
 
 ```python
-aligned = dataframe.reindex(
-    columns=schema.names
-)
+aligned = dataframe.reindex(columns=schema.names)
 
 return pa.Table.from_pandas(
     aligned,
@@ -6841,9 +6839,7 @@ load_silver_data(
 foi validada a interface pública:
 
 ```python
-load_silver(
-    settings
-)
+load_silver(settings)
 ```
 
 O teste configura:
