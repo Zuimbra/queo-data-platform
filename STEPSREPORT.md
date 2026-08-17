@@ -5348,3 +5348,2011 @@ teste integrado da Silver
 fechamento da Silver v1
 ```
 
+---
+
+# 71. Implementar incrementalidade Silver por `batch_id`
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        └── incremental.py
+```
+
+## O que?
+
+A Silver passou a possuir uma camada dedicada à descoberta do escopo incremental.
+
+Até este ponto, os componentes Silver eram capazes de:
+
+```text
+normalizar
+classificar
+transformar
+persistir
+```
+
+mas ainda não existia uma forma de decidir:
+
+```text
+quais dados precisam ser recalculados
+quando um novo batch chega na Bronze?
+```
+
+Foi criada:
+
+```python
+SilverAffectedPartitions
+```
+
+com:
+
+```text
+event_dates
+rejection_dates
+```
+
+e propriedades auxiliares:
+
+```text
+include_unknown
+is_empty
+```
+
+Também foram implementadas:
+
+```python
+normalize_batch_ids(...)
+discover_affected_partitions(...)
+load_incremental_bronze_scope(...)
+```
+
+---
+
+## Para que?
+
+Permitir que a Silver deixe de realizar rebuild completo em toda execução.
+
+O objetivo é transformar:
+
+```text
+novo batch
+    ↓
+reprocessar toda Bronze
+    ↓
+regravar toda Silver
+```
+
+em:
+
+```text
+novo batch
+    ↓
+descobrir datas impactadas
+    ↓
+reprocessar somente o escopo necessário
+    ↓
+substituir apenas as partições afetadas
+```
+
+Isso reduz:
+
+```text
+leitura desnecessária
+transformação desnecessária
+escrita desnecessária
+```
+
+sem comprometer a consistência das tabelas.
+
+---
+
+## Como?
+
+### Normalização dos `batch_ids`
+
+Foi criada:
+
+```python
+normalize_batch_ids(...)
+```
+
+A função recebe:
+
+```text
+list
+set
+tuple
+None
+```
+
+e produz uma tupla:
+
+```text
+limpa
+deduplicada
+ordenada
+```
+
+Exemplo:
+
+```text
+[
+    " batch-002 ",
+    "batch-001",
+    "batch-002",
+    ""
+]
+```
+
+resulta em:
+
+```text
+(
+    "batch-001",
+    "batch-002",
+)
+```
+
+Isso impede que detalhes de entrada influenciem o comportamento incremental.
+
+---
+
+## Descoberta das datas afetadas
+
+Foi criada:
+
+```python
+discover_affected_partitions(...)
+```
+
+A função consulta a Bronze consolidada:
+
+```text
+01_bronze/tracker_logs
+```
+
+e considera apenas os batches recém-inseridos para descobrir:
+
+```text
+quais event_dates foram afetadas?
+quais rejection_dates foram afetadas?
+```
+
+O timestamp de evento segue a mesma regra da normalização Silver:
+
+```text
+TM_STAMP
+    ↓ se inválido ou ausente
+DATA_SERVIDOR
+```
+
+conceitualmente:
+
+```sql
+COALESCE(
+    TRY_CAST(TM_STAMP AS TIMESTAMP),
+    TRY_CAST(DATA_SERVIDOR AS TIMESTAMP)
+)
+```
+
+Quando há um timestamp válido:
+
+```text
+2026-08-17 11:59:50
+```
+
+a partição afetada é:
+
+```text
+2026-08-17
+```
+
+---
+
+## Regra fundamental: batch descobre a partição, mas não define o rebuild
+
+Esta é uma das regras mais importantes da Silver incremental.
+
+Considere:
+
+```text
+batch-old
+row A
+event_date = 2026-08-17
+```
+
+Depois chega:
+
+```text
+batch-new
+row B
+event_date = 2026-08-17
+```
+
+O `batch-new` serve para descobrir:
+
+```text
+2026-08-17 foi afetado
+```
+
+Mas o rebuild não pode fazer:
+
+```text
+WHERE batch_id = batch-new
+```
+
+porque isso produziria:
+
+```text
+2026-08-17
+└── row B
+```
+
+apagando:
+
+```text
+row A
+```
+
+quando a partição fosse substituída.
+
+O comportamento correto é:
+
+```text
+batch-new
+    ↓
+discover_affected_partitions()
+    ↓
+2026-08-17
+    ↓
+load_incremental_bronze_scope()
+    ↓
+TODAS as linhas Bronze de 2026-08-17
+    │
+    ├── row A
+    └── row B
+    ↓
+rebuild da partição
+```
+
+Portanto:
+
+```text
+batch_id
+→ mecanismo de descoberta
+
+event_date
+→ unidade real de reconstrução
+```
+
+Essa separação é o que permite suporte correto a:
+
+```text
+late-arriving data
+```
+
+---
+
+## Late-arriving data
+
+Late-arriving representa um registro que chega agora, mas pertence logicamente a uma data anterior.
+
+Exemplo:
+
+```text
+execução inicial
+2026-08-17
+└── row-old
+```
+
+Depois:
+
+```text
+novo arquivo recebido em outro momento
+└── row-late
+    event_date = 2026-08-17
+```
+
+A nova linha não deve simplesmente ser adicionada à Silver sem considerar o estado completo da data.
+
+O fluxo implementado é:
+
+```text
+row-late
+    ↓
+batch-new
+    ↓
+affected_event_dates
+    ↓
+2026-08-17
+    ↓
+recarregar Bronze inteira de 2026-08-17
+    ↓
+row-old + row-late
+    ↓
+reconstruir Silver 2026-08-17
+```
+
+---
+
+## Tratamento da partição `unknown`
+
+Registros que não possuem:
+
+```text
+TM_STAMP válido
+```
+
+nem:
+
+```text
+DATA_SERVIDOR válido
+```
+
+não possuem data de evento.
+
+Esses registros são rejeitados com:
+
+```text
+rejection_date = "unknown"
+```
+
+A incrementalidade também precisa reconstruir essa partição corretamente.
+
+Considere:
+
+```text
+batch-old
+row-old-unknown
+
+batch-new
+row-new-unknown
+```
+
+Quando `batch-new` afeta:
+
+```text
+unknown
+```
+
+o rebuild precisa carregar:
+
+```text
+row-old-unknown
++
+row-new-unknown
+```
+
+e não somente:
+
+```text
+row-new-unknown
+```
+
+Por isso:
+
+```python
+include_unknown
+```
+
+determina se:
+
+```python
+load_incremental_bronze_scope(...)
+```
+
+também deve recuperar todas as linhas Bronze sem timestamp válido.
+
+---
+
+## Validação do contrato Bronze
+
+A incrementalidade valida que a Bronze possui:
+
+```text
+DATA_SERVIDOR
+TM_STAMP
+batch_id
+```
+
+antes de executar a descoberta.
+
+A Silver não assume silenciosamente que qualquer Delta Table pode ser utilizada como Bronze.
+
+---
+
+## Testes
+
+Foram adicionados testes cobrindo:
+
+```text
+normalização de batch_ids
+batch_ids vazios
+descoberta de event_date
+timestamp inválido → unknown
+late-arriving recupera toda a data
+unknown recupera todas as linhas sem timestamp
+```
+
+O teste central comprova:
+
+```text
+batch-new
+        ↓
+2026-08-17 afetado
+        ↓
+scope Bronze
+        │
+        ├── row-old
+        └── row-late
+```
+
+e também comprova que:
+
+```text
+row de 2026-08-18
+```
+
+não entra no processamento de `2026-08-17`.
+
+### Commit previsto / realizado nesta etapa
+
+```text
+feat: add silver incremental partition discovery
+```
+
+---
+
+# 72. Criar o serviço de orquestração da Silver
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        └── service.py
+```
+
+## O que?
+
+Até este ponto, a Silver possuía componentes independentes:
+
+```text
+normalization.py
+classification.py
+transformation.py
+writer.py
+incremental.py
+```
+
+mas ainda faltava uma fronteira pública que executasse essas peças como uma única camada.
+
+Foi criado:
+
+```python
+load_silver_data(...)
+```
+
+e uma interface baseada em configuração:
+
+```python
+load_silver(...)
+```
+
+Também foram definidos:
+
+```python
+SilverLoadResult
+SilverPaths
+SilverMode
+```
+
+---
+
+## Para que?
+
+Transformar os componentes isolados em um pipeline Silver real:
+
+```text
+Bronze
+    ↓
+scope
+    ↓
+normalização
+    ↓
+classificação
+    ↓
+transformação
+    ↓
+persistência
+    ↓
+SilverLoadResult
+```
+
+O `service.py` não recria a lógica interna de cada componente.
+
+Ele apenas coordena:
+
+```text
+incremental.py
+normalization.py
+classification.py
+transformation.py
+writer.py
+```
+
+Isso evita voltar ao desenho monolítico do projeto anterior.
+
+---
+
+## Como?
+
+### Resolução dos caminhos
+
+Foi criado:
+
+```python
+SilverPaths
+```
+
+contendo:
+
+```text
+bronze
+telemetry
+identity
+rejected
+```
+
+A função:
+
+```python
+get_silver_paths(...)
+```
+
+resolve:
+
+```text
+01_bronze/tracker_logs
+
+02_silver/telemetry_events
+02_silver/device_identity_events
+02_silver/rejected_logs
+```
+
+---
+
+## Carregamento da Bronze
+
+Foi criada:
+
+```python
+load_bronze_table(...)
+```
+
+Antes de abrir a origem, o código verifica:
+
+```python
+is_delta_table(...)
+```
+
+Se a Bronze consolidada não existir, a Silver não tenta continuar com um diretório inválido.
+
+---
+
+# 73. Implementar os modos `FULL`, `INCREMENTAL` e `NOOP`
+
+Foi definido:
+
+```python
+SilverMode = Literal[
+    "FULL",
+    "INCREMENTAL",
+    "NOOP",
+]
+```
+
+## O que?
+
+A execução Silver passou a ter três comportamentos explícitos.
+
+---
+
+## `FULL`
+
+O modo:
+
+```text
+FULL
+```
+
+representa reconstrução completa.
+
+Ele ocorre quando:
+
+```text
+batch_ids não foram informados
+```
+
+ou quando:
+
+```text
+um processamento incremental foi solicitado
+mas a Silver ainda não está completamente disponível
+```
+
+Nesse caso:
+
+```text
+Bronze inteira
+    ↓
+normalização
+    ↓
+classificação
+    ↓
+transformações
+    ↓
+overwrite completo Silver
+```
+
+---
+
+## `INCREMENTAL`
+
+O modo:
+
+```text
+INCREMENTAL
+```
+
+é utilizado quando:
+
+```text
+batch_ids foram informados
++
+as três Delta Tables Silver já existem
+```
+
+O fluxo é:
+
+```text
+batch_ids
+    ↓
+discover_affected_partitions()
+    ↓
+affected_event_dates
+affected_rejection_dates
+    ↓
+load_incremental_bronze_scope()
+    ↓
+reprocessar escopo
+    ↓
+replace seletivo
+```
+
+---
+
+## `NOOP`
+
+O modo:
+
+```text
+NOOP
+```
+
+é retornado quando:
+
+```text
+batch_ids foram solicitados
+```
+
+mas:
+
+```text
+nenhuma partição Silver é afetada
+```
+
+Exemplo:
+
+```text
+batch-does-not-exist
+```
+
+O resultado é:
+
+```text
+mode = NOOP
+
+telemetry_rows_written = 0
+identity_rows_written = 0
+rejected_rows_written = 0
+```
+
+Isso impede processamento inútil.
+
+---
+
+# 74. Criar `SilverLoadResult`
+
+Foi criado:
+
+```python
+@dataclass(frozen=True)
+class SilverLoadResult:
+```
+
+com informações como:
+
+```text
+mode
+batch_ids
+affected_event_dates
+affected_rejection_dates
+telemetry_rows_written
+identity_rows_written
+rejected_rows_written
+```
+
+Também foi criada:
+
+```python
+has_changes
+```
+
+com a regra:
+
+```text
+FULL
+→ True
+
+INCREMENTAL
+→ True
+
+NOOP
+→ False
+```
+
+## Para que?
+
+A Silver deixa de simplesmente:
+
+```text
+executar
+```
+
+e passa a comunicar para a camada seguinte:
+
+```text
+o que foi alterado?
+```
+
+Isso é importante para a futura Gold.
+
+A Gold não precisa conhecer diretamente:
+
+```text
+source_file
+source_file_hash
+batch_id
+```
+
+Ela poderá receber:
+
+```text
+affected_event_dates
+affected_rejection_dates
+```
+
+e decidir quais produtos derivados precisam ser recalculados.
+
+O fluxo planejado passa a ser:
+
+```text
+BronzeLoadResult
+        │
+        │ batch_ids
+        ▼
+Silver
+        │
+        ▼
+SilverLoadResult
+        │
+        ├── affected_event_dates
+        └── affected_rejection_dates
+                │
+                ▼
+              Gold
+```
+
+---
+
+# 75. Integrar o fluxo completo Bronze → Silver
+
+A função:
+
+```python
+load_silver_data(...)
+```
+
+passou a coordenar todas as etapas.
+
+## Fluxo `FULL`
+
+```text
+Bronze Delta
+    ↓
+to_pandas()
+    ↓
+normalize_bronze_dataframe()
+    ↓
+classify_normalized_dataframe()
+    ↓
+┌──────────────────────┬──────────────────────┬───────────────┐
+│ telemetry            │ identity             │ rejected      │
+└──────────────────────┴──────────────────────┴───────────────┘
+            ↓
+transformações tipadas
+            ↓
+dataframe_to_arrow()
+            ↓
+write_full_silver_table()
+            ↓
+SilverLoadResult(mode="FULL")
+```
+
+---
+
+## Fluxo `INCREMENTAL`
+
+```text
+Bronze Delta
+    │
+    │ batch_ids
+    ▼
+discover_affected_partitions()
+    ↓
+load_incremental_bronze_scope()
+    ↓
+TODAS as linhas das partições afetadas
+    ↓
+normalização
+    ↓
+classificação
+    ↓
+transformação
+    ↓
+write_incremental_silver_partitions()
+    ↓
+SilverLoadResult(mode="INCREMENTAL")
+```
+
+---
+
+## Fluxo `NOOP`
+
+```text
+batch_ids
+    ↓
+nenhuma linha correspondente
+    ↓
+nenhuma partição afetada
+    ↓
+NOOP
+```
+
+Não existe:
+
+```text
+normalização
+transformação
+escrita Delta
+```
+
+nesse caso.
+
+---
+
+# 76. Criar testes de integração do serviço Silver
+
+Foi criado:
+
+```text
+tests/
+└── integration/
+    └── test_silver_service.py
+```
+
+## O que?
+
+Até este ponto, a maior parte da Silver estava coberta por testes unitários.
+
+O novo teste de integração verifica o comportamento da camada funcionando como uma unidade.
+
+Os primeiros cenários implementados foram:
+
+```text
+FULL cria os três produtos
+batch desconhecido → NOOP
+late-arriving → INCREMENTAL seletivo
+```
+
+---
+
+## FULL cria os produtos Silver
+
+O teste monta uma Bronze contendo:
+
+```text
+1 telemetria
+1 identidade T1
+1 registro rejeitado
+```
+
+Depois executa:
+
+```python
+load_silver_data(...)
+```
+
+e confirma:
+
+```text
+mode = FULL
+
+telemetry_rows_written = 1
+identity_rows_written = 1
+rejected_rows_written = 1
+```
+
+Também verifica a existência física de:
+
+```text
+telemetry_events
+device_identity_events
+rejected_logs
+```
+
+como Delta Tables.
+
+---
+
+## Batch inexistente retorna `NOOP`
+
+O teste primeiro cria uma Silver válida.
+
+Depois solicita:
+
+```text
+batch-does-not-exist
+```
+
+O retorno esperado é:
+
+```text
+mode = NOOP
+```
+
+com:
+
+```text
+0 writes
+```
+
+---
+
+## Late-arriving reconstrói somente a data afetada
+
+O cenário utiliza inicialmente:
+
+```text
+2026-08-17
+└── old-17
+
+2026-08-18
+└── row-18
+```
+
+Depois é adicionada à Bronze:
+
+```text
+late-17
+batch-new
+event_date = 2026-08-17
+```
+
+A Silver incremental recebe:
+
+```text
+batch-new
+```
+
+e descobre:
+
+```text
+affected_event_dates
+→ ("2026-08-17",)
+```
+
+Depois do processamento:
+
+```text
+2026-08-17
+├── old-17
+└── late-17
+
+2026-08-18
+└── row-18
+```
+
+Isso comprova simultaneamente que:
+
+```text
+dados antigos da data afetada são preservados
+```
+
+e:
+
+```text
+datas não afetadas não são regravadas
+```
+
+---
+
+# 77. Identificar falha com produtos Silver vazios
+
+Durante os testes de integração foi encontrado um problema importante.
+
+A primeira execução produziu:
+
+```text
+1 telemetria
+0 identidades
+```
+
+O conjunto:
+
+```text
+identity
+```
+
+estava corretamente vazio.
+
+Porém, ao converter esse DataFrame para PyArrow, ocorreu:
+
+```text
+ArrowTypeError
+```
+
+com uma mensagem equivalente a:
+
+```text
+Expected a string or bytes dtype,
+got int32
+
+Conversion failed for column event_date
+```
+
+## O que aconteceu?
+
+O fluxo era:
+
+```text
+identity sem linhas
+    ↓
+DuckDB retorna DataFrame vazio
+    ↓
+Pandas/DuckDB infere dtype de event_date
+    ↓
+int32
+```
+
+enquanto o contrato Silver exige:
+
+```text
+event_date
+→ string
+```
+
+Depois:
+
+```python
+pa.Table.from_pandas(
+    dataframe,
+    schema=DEVICE_IDENTITY_SCHEMA,
+)
+```
+
+tentava reconciliar:
+
+```text
+DataFrame
+event_date = int32
+```
+
+com:
+
+```text
+Arrow schema
+event_date = string
+```
+
+e falhava.
+
+---
+
+## Por que isso é um bug importante?
+
+Uma tabela Silver vazia é um estado normal.
+
+Exemplos:
+
+```text
+arquivo só possui telemetria
+→ identity vazio
+
+arquivo só possui registros válidos
+→ rejected vazio
+
+arquivo só possui T1
+→ telemetry vazio
+```
+
+Portanto:
+
+```text
+zero linhas
+```
+
+não pode ser tratado como erro.
+
+Além disso, o schema não pode depender da inferência automática de um DataFrame vazio.
+
+---
+
+# 78. Corrigir preservação de schema em produtos vazios
+
+A função:
+
+```python
+dataframe_to_arrow(...)
+```
+
+em:
+
+```text
+silver/writer.py
+```
+
+foi ajustada.
+
+## Antes
+
+O fluxo sempre executava:
+
+```python
+aligned = dataframe.reindex(
+    columns=schema.names
+)
+
+return pa.Table.from_pandas(
+    aligned,
+    schema=schema,
+    preserve_index=False,
+    safe=True,
+)
+```
+
+mesmo quando:
+
+```text
+dataframe.empty = True
+```
+
+---
+
+## Depois
+
+Foi adicionada uma regra explícita:
+
+```python
+if dataframe.empty:
+    return pa.Table.from_batches(
+        [],
+        schema=schema,
+    )
+```
+
+O fluxo passa a ser:
+
+```text
+DataFrame possui linhas?
+        │
+   ┌────┴────┐
+   │         │
+  sim       não
+   │         │
+   ▼         ▼
+from_pandas  criar tabela Arrow vazia
+             diretamente com schema
+```
+
+Agora:
+
+```text
+event_date vazio
+```
+
+continua sendo:
+
+```text
+string
+```
+
+porque:
+
+```text
+schema explícito
+```
+
+é a fonte de verdade.
+
+---
+
+## Teste de regressão
+
+Foi adicionado um teste que cria deliberadamente um DataFrame vazio com tipos incorretos:
+
+```text
+event_date     → int32
+device_serial  → int32
+value          → int32
+```
+
+mas passa um schema:
+
+```text
+event_date     → string
+device_serial  → string
+value          → float64
+```
+
+O resultado esperado é:
+
+```text
+0 linhas
++
+schema exatamente igual ao contrato
+```
+
+Isso garante que o bug não seja reintroduzido.
+
+---
+
+# 79. Corrigir localização do teste de schema vazio
+
+Durante a inclusão do teste anterior ocorreu um erro de organização.
+
+O teste:
+
+```python
+test_empty_dataframe_uses_explicit_schema()
+```
+
+foi inicialmente colocado em:
+
+```text
+tests/unit/test_bronze_writer.py
+```
+
+quando deveria estar em:
+
+```text
+tests/unit/test_silver_writer.py
+```
+
+Isso produziu erros como:
+
+```text
+Undefined name dataframe_to_arrow
+Undefined name TEST_SCHEMA
+Undefined name pa
+```
+
+e:
+
+```text
+NameError
+```
+
+## Correção
+
+O teste foi removido do arquivo Bronze e movido para:
+
+```text
+tests/unit/test_silver_writer.py
+```
+
+onde já existem:
+
+```text
+dataframe_to_arrow
+TEST_SCHEMA
+pyarrow as pa
+```
+
+A correção preserva a separação:
+
+```text
+Bronze writer tests
+→ comportamento Bronze
+
+Silver writer tests
+→ comportamento Silver
+```
+
+Após essa correção, a suíte avançou para:
+
+```text
+92 testes
+```
+
+antes da inclusão dos cenários finais de fechamento da Silver.
+
+---
+
+# 80. Expandir os testes de fechamento da Silver
+
+Depois da estabilização do `service.py`, foram adicionados três cenários adicionais ao teste de integração.
+
+Os cenários são:
+
+```text
+primeira requisição incremental → FULL
+unknown incremental
+execução através de Settings
+```
+
+---
+
+## Primeira execução incremental precisa cair para `FULL`
+
+Considere:
+
+```text
+Bronze
+├── 2026-08-17
+└── 2026-08-18
+```
+
+A Silver ainda não existe.
+
+A chamada solicita:
+
+```text
+batch de 2026-08-18
+```
+
+Seria incorreto criar:
+
+```text
+Silver
+└── somente 2026-08-18
+```
+
+porque a camada passaria a representar apenas uma parte da Bronze.
+
+Por isso foi testada a regra:
+
+```text
+Silver inexistente
+        +
+batch_ids informados
+        ↓
+FULL
+```
+
+O resultado precisa conter:
+
+```text
+2026-08-17
+2026-08-18
+```
+
+e não somente a data do batch solicitado.
+
+---
+
+# 81. Validar rebuild incremental de `unknown`
+
+Foi criado um teste de integração para a partição:
+
+```text
+rejected_logs/unknown
+```
+
+## Cenário inicial
+
+```text
+valid-row
++
+old-unknown
+```
+
+A Silver completa é criada.
+
+Depois chega:
+
+```text
+new-unknown
+batch-new
+```
+
+com:
+
+```text
+TM_STAMP inválido
+DATA_SERVIDOR inválido
+```
+
+A descoberta incremental resulta em:
+
+```text
+affected_event_dates
+→ ()
+
+affected_rejection_dates
+→ ("unknown",)
+```
+
+A Silver então reconstrói:
+
+```text
+unknown
+├── old-unknown
+└── new-unknown
+```
+
+O teste comprova que a implementação não produz:
+
+```text
+unknown
+└── new-unknown
+```
+
+apagando a rejeição antiga.
+
+---
+
+# 82. Validar execução Silver baseada em `Settings`
+
+Além da função de baixo nível:
+
+```python
+load_silver_data(
+    bronze_dir=...,
+    silver_dir=...,
+)
+```
+
+foi validada a interface pública:
+
+```python
+load_silver(
+    settings
+)
+```
+
+O teste configura:
+
+```text
+QUEO_DATA_DIR
+```
+
+em um diretório temporário.
+
+Depois:
+
+```python
+settings = load_settings()
+```
+
+e executa:
+
+```python
+load_silver(settings)
+```
+
+A função utiliza:
+
+```text
+settings.bronze_dir
+settings.silver_dir
+```
+
+sem caminhos hardcoded.
+
+Isso fecha a integração entre:
+
+```text
+config/
+    ↓
+Silver
+```
+
+e prepara a camada para futura orquestração do pipeline.
+
+---
+
+# 83. Estado dos testes após o fechamento da Silver
+
+A suíte de integração Silver passou a possuir:
+
+```text
+6 testes
+```
+
+A execução específica registrou:
+
+```text
+tests/integration/test_silver_service.py
+→ 6 passed
+```
+
+Os cenários cobertos são:
+
+```text
+FULL cria os produtos
+batch desconhecido → NOOP
+late-arriving → INCREMENTAL
+primeiro incremental sem Silver → FULL
+unknown incremental
+execução via Settings
+```
+
+Depois foi executada a suíte completa:
+
+```text
+pytest
+→ 95 testes aprovados
+```
+
+Resultado registrado:
+
+```text
+95 passed
+```
+
+O type checker também foi executado:
+
+```text
+pyright
+→ 0 errors
+→ 0 warnings
+→ 0 informations
+```
+
+Portanto, neste ponto:
+
+```text
+runtime                 ✅
+testes unitários        ✅
+testes de integração    ✅
+type checking           ✅
+```
+
+---
+
+# 84. Pendência final de lint antes do commit de fechamento
+
+Na última execução registrada, o Ruff encontrou apenas:
+
+```text
+I001
+Import block is un-sorted or un-formatted
+```
+
+em:
+
+```text
+tests/integration/test_silver_service.py
+```
+
+A inconsistência ocorre porque:
+
+```python
+from queo_data_platform.config.settings import (
+    load_settings,
+)
+```
+
+foi adicionado depois dos demais imports internos.
+
+Não existe erro funcional associado.
+
+O próprio Ruff informa que a correção pode ser feita automaticamente com:
+
+```powershell
+uv run ruff check . --fix
+```
+
+seguido de:
+
+```powershell
+uv run ruff format .
+```
+
+Depois disso deve ser executado novamente:
+
+```powershell
+uv run ruff check .
+uv run pyright
+uv run pytest
+```
+
+O estado esperado para fechamento é:
+
+```text
+ruff
+→ All checks passed
+
+pyright
+→ 0 errors
+
+pytest
+→ 95 passed
+```
+
+---
+
+# 85. Estado atual da camada Silver
+
+Neste ponto a Silver possui a seguinte estrutura:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        ├── __init__.py
+        ├── normalization.py
+        ├── classification.py
+        ├── transformation.py
+        ├── incremental.py
+        ├── writer.py
+        └── service.py
+```
+
+Os contratos ficam em:
+
+```text
+src/
+└── queo_data_platform/
+    └── contracts/
+        └── silver.py
+```
+
+O fluxo completo implementado é:
+
+```text
+                         BRONZE
+
+                01_bronze/tracker_logs
+                           │
+                           │
+                           ▼
+                    Silver Service
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+             FULL                  INCREMENTAL
+              │                         │
+              │                         ▼
+              │                  batch_ids
+              │                         │
+              │                         ▼
+              │               affected partitions
+              │                         │
+              │                         ▼
+              │               Bronze scope completo
+              │                         │
+              └─────────────┬───────────┘
+                            │
+                            ▼
+                  normalization.py
+                            │
+                            ▼
+                  classification.py
+                  ┌─────────┼─────────┐
+                  │         │         │
+                  ▼         ▼         ▼
+             telemetry   identity   rejected
+                  │         │
+                  └────┬────┘
+                       ▼
+               transformation.py
+                       │
+                       ▼
+                    writer.py
+                       │
+        ┌──────────────┼─────────────────┐
+        │              │                 │
+        ▼              ▼                 ▼
+telemetry_events  device_identity   rejected_logs
+                       _events
+        │              │                 │
+        └──────────────┼─────────────────┘
+                       ▼
+                SilverLoadResult
+                       │
+            ┌──────────┴──────────────┐
+            │                         │
+ affected_event_dates    affected_rejection_dates
+            │                         │
+            └──────────┬──────────────┘
+                       ▼
+                  futura Gold
+```
+
+---
+
+# 86. Capacidades concluídas na Silver
+
+A camada atualmente possui suporte para:
+
+```text
+normalização de dados Bronze
+trim de campos
+string vazia → NULL
+TRY_CAST de timestamps
+preservação de campos raw
+preservação de lineage
+
+classificação T1
+classificação de telemetria T<n>
+rejeições estruturais
+rejection_reason
+rejection_date = unknown
+
+tipagem de telemetria
+tipagem de identidade
+validação de coordenadas
+position_quality
+validação de ICCID
+validação de IMSI
+validação de IMEI
+
+schemas PyArrow explícitos
+produtos vazios com schema estável
+
+Delta Lake particionado
+full rebuild
+replace seletivo de partições
+remoção de partição vazia
+
+batch-aware processing
+affected partitions
+late-arriving data
+unknown incremental
+
+FULL
+INCREMENTAL
+NOOP
+
+SilverLoadResult
+Settings
+testes unitários
+testes de integração
+```
+
+---
+
+# 87. Relação atual Bronze → Silver
+
+A fronteira entre as camadas agora está clara.
+
+A Bronze retorna:
+
+```python
+BronzeLoadResult
+```
+
+contendo:
+
+```text
+has_new_data
+batch_ids
+```
+
+Esses batches podem alimentar:
+
+```python
+load_silver(
+    settings,
+    batch_ids=bronze_result.batch_ids,
+)
+```
+
+A Silver não precisa receber:
+
+```text
+nome do CSV
+hash do arquivo
+linhas específicas alteradas
+```
+
+Ela utiliza os batches apenas para descobrir:
+
+```text
+quais partições foram afetadas
+```
+
+Depois reconstrói o estado correto dessas partições.
+
+O fluxo arquitetural passa a ser:
+
+```text
+Raw
+ ↓
+Bronze
+ ↓
+BronzeLoadResult
+ ↓
+batch_ids
+ ↓
+Silver
+ ↓
+SilverLoadResult
+ ↓
+affected_event_dates
+affected_rejection_dates
+ ↓
+Gold
+```
+
+Essa interface reduz o acoplamento entre as camadas.
+
+---
+
+# 88. Próximo ponto de desenvolvimento
+
+Após corrigir o último `I001` do Ruff e realizar o commit de fechamento, a camada Silver pode ser considerada concluída nesta primeira versão.
+
+O commit de fechamento previsto é:
+
+```text
+feat: finalize silver processing layer
+```
+
+A próxima camada a ser iniciada será:
+
+```text
+Gold
+```
+
+Os produtos Gold já definidos pelo domínio são:
+
+```text
+data_quality_summary
+device_daily_summary
+device_last_position
+device_route_points
+dim_device
+```
+
+A estratégia deve continuar a mesma utilizada na Silver:
+
+```text
+contratos
+    ↓
+builders / transformações por produto
+    ↓
+persistência
+    ↓
+incrementalidade
+    ↓
+service
+    ↓
+testes de integração
+```
+
+evitando recriar um único módulo Gold monolítico.
+
+---
+
+# 89. Estado geral do projeto neste ponto
+
+```text
+                         QUEO DATA PLATFORM
+
+
+Raw
+│
+├── inbox
+├── archive
+└── quarantine
+        │
+        ▼
+Bronze                                      ✅
+│
+├── files.py
+├── validation.py
+├── lineage.py
+├── control.py
+├── writer.py
+└── service.py
+        │
+        ▼
+01_bronze/tracker_logs
+        │
+        ▼
+BronzeLoadResult
+        │
+        │ batch_ids
+        ▼
+Silver                                      ✅ funcional
+│
+├── normalization.py
+├── classification.py
+├── transformation.py
+├── incremental.py
+├── writer.py
+└── service.py
+        │
+        ▼
+02_silver/
+│
+├── telemetry_events
+├── device_identity_events
+└── rejected_logs
+        │
+        ▼
+SilverLoadResult
+        │
+        ├── affected_event_dates
+        └── affected_rejection_dates
+        │
+        ▼
+Gold                                        ⏳ próximo passo
+│
+├── data_quality_summary
+├── device_daily_summary
+├── device_last_position
+├── device_route_points
+└── dim_device
+        │
+        ▼
+Query Layer                                 ⏳
+        │
+        ├── REST API                         ⏳
+        └── MCP                              ⏳
+```
+
+Estado de validação registrado:
+
+```text
+pytest
+→ 95 passed
+
+pyright
+→ 0 errors
+→ 0 warnings
+→ 0 informations
+
+ruff
+→ 1 pendência I001 de ordenação de import
+   em test_silver_service.py
+```
+
+Portanto, o código da Silver está funcionalmente validado.
+
+Antes de iniciar a Gold, resta apenas:
+
+```text
+1. corrigir o import com Ruff;
+2. repetir ruff / pyright / pytest;
+3. realizar o commit de fechamento;
+4. iniciar os contratos Gold.
+```
