@@ -7352,3 +7352,2435 @@ Antes de iniciar a Gold, resta apenas:
 3. realizar o commit de fechamento;
 4. iniciar os contratos Gold.
 ```
+
+---
+
+# 90. Iniciar a camada Gold pelos contratos estruturais
+
+Após o fechamento funcional da Silver, o desenvolvimento avançou para:
+
+```text
+src/
+└── queo_data_platform/
+    └── gold/
+```
+
+Antes de implementar as agregações, foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── contracts/
+        └── gold.py
+```
+
+## O que?
+
+O contrato Gold centraliza os nomes dos cinco produtos de dados planejados:
+
+```python
+DIM_DEVICE_TABLE_NAME = "dim_device"
+
+DEVICE_LAST_POSITION_TABLE_NAME = (
+    "device_last_position"
+)
+
+DEVICE_ROUTE_POINTS_TABLE_NAME = (
+    "device_route_points"
+)
+
+DEVICE_DAILY_SUMMARY_TABLE_NAME = (
+    "device_daily_summary"
+)
+
+DATA_QUALITY_SUMMARY_TABLE_NAME = (
+    "data_quality_summary"
+)
+```
+
+A Gold passa, portanto, a possuir os seguintes produtos:
+
+```text
+03_gold/
+│
+├── dim_device
+├── device_last_position
+├── device_route_points
+├── device_daily_summary
+└── data_quality_summary
+```
+
+## Para que?
+
+A Silver organiza eventos tratados.
+
+A Gold possui outra responsabilidade:
+
+```text
+Silver
+→ eventos tratados
+
+Gold
+→ produtos prontos para consulta
+```
+
+Por exemplo:
+
+```text
+telemetry_events
+```
+
+contém vários eventos de um mesmo dispositivo.
+
+Já:
+
+```text
+device_last_position
+```
+
+deve responder diretamente:
+
+```text
+qual é a posição mais recente do dispositivo?
+```
+
+sem obrigar API, Query Layer ou MCP a reconstruírem essa informação a cada consulta.
+
+---
+
+# 91. Separar produtos Gold por estratégia de atualização
+
+No contrato também foram definidas duas categorias.
+
+## Tabelas orientadas a entidade
+
+```python
+GOLD_ENTITY_TABLES = (
+    DIM_DEVICE_TABLE_NAME,
+    DEVICE_LAST_POSITION_TABLE_NAME,
+)
+```
+
+Essas tabelas possuem como chave principal lógica:
+
+```python
+GOLD_DEVICE_KEY = "device_serial"
+```
+
+Portanto:
+
+```text
+dim_device
+device_last_position
+        ↓
+uma linha atual por device_serial
+```
+
+A estratégia de persistência futura será baseada em:
+
+```text
+MERGE / UPSERT
+ON device_serial
+```
+
+---
+
+## Tabelas orientadas a partição temporal
+
+Também foi definido:
+
+```python
+GOLD_EVENT_PARTITION_COLUMN = "event_date"
+
+GOLD_QUALITY_PARTITION_COLUMN = (
+    "metric_date"
+)
+```
+
+E:
+
+```python
+GOLD_PARTITIONED_TABLES = {
+    DEVICE_ROUTE_POINTS_TABLE_NAME:
+        GOLD_EVENT_PARTITION_COLUMN,
+
+    DEVICE_DAILY_SUMMARY_TABLE_NAME:
+        GOLD_EVENT_PARTITION_COLUMN,
+
+    DATA_QUALITY_SUMMARY_TABLE_NAME:
+        GOLD_QUALITY_PARTITION_COLUMN,
+}
+```
+
+O desenho passa a ser:
+
+```text
+device_route_points
+        ↓
+event_date
+
+device_daily_summary
+        ↓
+event_date
+
+data_quality_summary
+        ↓
+metric_date
+```
+
+## Para que?
+
+Permitir que o incremental da Gold tenha duas estratégias distintas:
+
+```text
+dados por entidade
+        ↓
+MERGE
+
+dados por data
+        ↓
+replace seletivo da partição
+```
+
+Isso acompanha a própria natureza dos produtos.
+
+---
+
+# 92. Criar as bases deduplicadas da Gold
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── gold/
+        └── base.py
+```
+
+O módulo define as relações Silver utilizadas internamente pelo DuckDB:
+
+```python
+SILVER_TELEMETRY_RELATION = "silver_telemetry"
+
+SILVER_IDENTITY_RELATION = "silver_identity"
+
+SILVER_REJECTED_RELATION = "silver_rejected"
+```
+
+E duas views intermediárias:
+
+```python
+TELEMETRY_GOLD_BASE_VIEW = (
+    "telemetry_gold_base"
+)
+
+IDENTITY_GOLD_BASE_VIEW = (
+    "identity_gold_base"
+)
+```
+
+## O que?
+
+A Gold não deve necessariamente agregar diretamente todas as linhas Silver.
+
+Antes dos produtos operacionais serem construídos, eventos logicamente equivalentes são deduplicados.
+
+O fluxo passa a ser:
+
+```text
+telemetry_events
+       ↓
+silver_telemetry
+       ↓
+telemetry_gold_base
+       ↓
+produtos Gold
+```
+
+e:
+
+```text
+device_identity_events
+       ↓
+silver_identity
+       ↓
+identity_gold_base
+       ↓
+produtos Gold
+```
+
+## Para que?
+
+A Bronze possui idempotência física por:
+
+```text
+row_id
+```
+
+Mas isso não significa que dois registros diferentes não possam representar o mesmo evento lógico.
+
+Exemplo:
+
+```text
+arquivo A
+row_id = AAA
+
+arquivo B
+row_id = BBB
+```
+
+Os dois registros podem ter:
+
+```text
+mesmo dispositivo
+mesmo timestamp
+mesmo tipo de mensagem
+mesmo serial_count
+mesma posição
+mesma velocidade
+```
+
+Na Bronze e Silver:
+
+```text
+AAA
+BBB
+```
+
+continuam sendo registros distintos de origem.
+
+Na Gold operacional:
+
+```text
+mesmo evento lógico
+        ↓
+uma ocorrência
+```
+
+---
+
+# 93. Implementar deduplicação lógica de telemetria
+
+A view:
+
+```text
+telemetry_gold_base
+```
+
+é criada com:
+
+```sql
+ROW_NUMBER() OVER (...)
+```
+
+A partição lógica utiliza:
+
+```text
+device_serial
+event_timestamp
+message_type
+serial_count
+latitude
+longitude
+speed
+```
+
+Campos opcionais são normalizados no critério através de:
+
+```sql
+COALESCE(
+    CAST(campo AS VARCHAR),
+    '__NULL__'
+)
+```
+
+## Como?
+
+O conceito central é:
+
+```sql
+QUALIFY
+    ROW_NUMBER() OVER (
+        PARTITION BY
+            device_serial,
+            event_timestamp,
+            message_type,
+            ...
+        ORDER BY
+            server_timestamp DESC NULLS LAST,
+            source_file DESC NULLS LAST
+    ) = 1
+```
+
+Portanto:
+
+```text
+evento lógico duplicado
+        ↓
+ordenar candidatos
+        ↓
+preferir recebimento mais recente
+        ↓
+manter uma linha
+```
+
+---
+
+## Filtro mínimo da base
+
+Também é exigido:
+
+```sql
+WHERE device_serial IS NOT NULL
+  AND event_timestamp IS NOT NULL
+```
+
+Assim, produtos Gold de dispositivo não trabalham com eventos que não possuam uma entidade ou momento identificável.
+
+---
+
+# 94. Implementar deduplicação lógica de identidade
+
+A mesma ideia foi aplicada em:
+
+```text
+identity_gold_base
+```
+
+Porém o critério lógico é diferente.
+
+A identidade é particionada por:
+
+```text
+device_serial
+event_timestamp
+imei
+imsi
+iccid
+```
+
+Portanto:
+
+```text
+mesmo device
++
+mesmo timestamp
++
+mesmo ICCID
++
+mesmo IMSI
++
+mesmo IMEI
+        ↓
+evento equivalente
+```
+
+Se os identificadores mudarem:
+
+```text
+IMEI antigo
+        ↓
+IMEI novo
+```
+
+os dois registros são preservados.
+
+## Para que?
+
+Eliminar retransmissões equivalentes sem perder mudanças reais de identidade.
+
+---
+
+# 95. Criar o produto Gold `dim_device`
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── gold/
+        └── dim_device.py
+```
+
+A principal função adicionada foi:
+
+```python
+build_dim_device(...)
+```
+
+## O que?
+
+O produto:
+
+```text
+dim_device
+```
+
+consolida telemetria e identidade em:
+
+```text
+uma linha por device_serial
+```
+
+O resultado contém informações como:
+
+```text
+device_serial
+
+current_imei
+current_imsi
+current_iccid
+current_identity_auxiliary
+current_protocol_version
+
+first_seen_at
+last_seen_at
+
+first_identity_at
+last_identity_at
+
+first_telemetry_at
+last_telemetry_at
+
+identity_event_count
+telemetry_event_count
+
+has_identity_event
+has_telemetry_event
+
+current_imei_format_valid
+current_imsi_format_valid
+current_iccid_format_valid
+```
+
+---
+
+# 96. Construir o resumo atual da identidade
+
+Dentro de `build_dim_device(...)` foi criado um CTE:
+
+```sql
+identity_summary
+```
+
+Ele agrega:
+
+```text
+identity_gold_base
+```
+
+por:
+
+```text
+device_serial
+```
+
+Exemplo:
+
+```sql
+MIN(event_timestamp)
+    AS first_identity_at
+
+MAX(event_timestamp)
+    AS last_identity_at
+
+COUNT(*)
+    AS identity_event_count
+```
+
+Os dados atuais são selecionados com:
+
+```sql
+ARG_MAX(
+    imei,
+    event_timestamp
+)
+```
+
+A mesma estratégia é usada para:
+
+```text
+IMEI
+IMSI
+ICCID
+identity_auxiliary
+protocol_version
+
+flags de validade
+```
+
+## Para que?
+
+Considere:
+
+```text
+09:00 → IMEI A
+15:00 → IMEI B
+```
+
+A dimensão deve apresentar:
+
+```text
+current_imei = IMEI B
+```
+
+mas continuar informando:
+
+```text
+first_identity_at
+last_identity_at
+identity_event_count
+```
+
+---
+
+# 97. Construir o resumo de telemetria da dimensão
+
+Também foi criado:
+
+```sql
+telemetry_summary
+```
+
+agrupado por:
+
+```text
+device_serial
+```
+
+Ele produz:
+
+```text
+first_telemetry_at
+last_telemetry_at
+telemetry_event_count
+latest_telemetry_protocol_version
+```
+
+O universo final de dispositivos é obtido com:
+
+```sql
+SELECT device_serial
+FROM identity_gold_base
+
+UNION
+
+SELECT device_serial
+FROM telemetry_gold_base
+```
+
+## Para que?
+
+Permitir que um dispositivo exista em:
+
+```text
+dim_device
+```
+
+mesmo que ainda não tenha produzido uma mensagem de identidade `T1`.
+
+Exemplo:
+
+```text
+device 2001
+
+telemetry ✅
+identity  ❌
+```
+
+Resultado:
+
+```text
+dim_device
+device_serial = 2001
+
+identity_event_count = 0
+telemetry_event_count = 1
+
+has_identity_event = false
+has_telemetry_event = true
+```
+
+---
+
+# 98. Calcular primeira e última atividade global do dispositivo
+
+Foi criado ainda:
+
+```sql
+all_activity
+```
+
+com:
+
+```text
+identity events
+      +
+telemetry events
+```
+
+seguido por:
+
+```sql
+activity_summary
+```
+
+que calcula:
+
+```sql
+MIN(event_timestamp)
+    AS first_seen_at
+
+MAX(event_timestamp)
+    AS last_seen_at
+```
+
+## Para que?
+
+`first_seen_at` e `last_seen_at` representam atividade do dispositivo na plataforma como um todo.
+
+Não apenas:
+
+```text
+telemetria
+```
+
+nem apenas:
+
+```text
+identidade
+```
+
+mas:
+
+```text
+identity + telemetry
+```
+
+---
+
+# 99. Preparar `dim_device` para incrementalidade por dispositivo
+
+`build_dim_device(...)` aceita:
+
+```python
+affected_devices: (
+    tuple[str, ...] | None
+)
+```
+
+Quando informado, é registrada uma relação temporária:
+
+```text
+affected_gold_devices
+```
+
+O resultado é filtrado para:
+
+```sql
+WHERE devices.device_serial IN (
+    SELECT device_serial
+    FROM affected_gold_devices
+)
+```
+
+O comportamento passa a ser:
+
+```text
+FULL
+→ affected_devices=None
+→ todos os dispositivos
+
+INCREMENTAL
+→ affected_devices=(...)
+→ somente dispositivos afetados
+```
+
+A persistência incremental ainda não foi implementada neste ponto.
+
+O builder apenas já está preparado para receber esse escopo.
+
+---
+
+# 100. Corrigir os tipos de timestamp nos testes Gold
+
+Durante os testes de `dim_device`, foi encontrado:
+
+```text
+AssertionError
+
+'2026-08-16 08:00:00'
+!=
+Timestamp('2026-08-16 08:00:00')
+```
+
+## O que aconteceu?
+
+Os fixtures de teste forneciam:
+
+```python
+"event_timestamp":
+    "2026-08-16 08:00:00"
+```
+
+ou seja:
+
+```text
+string
+```
+
+Como o DataFrame era registrado diretamente no DuckDB:
+
+```text
+string
+    ↓
+DuckDB
+    ↓
+MIN / MAX
+    ↓
+string
+```
+
+Porém, o contrato real da Silver já estabelece timestamps tipados.
+
+## Correção
+
+Os testes passaram a utilizar:
+
+```python
+pd.Timestamp(
+    "2026-08-16 08:00:00"
+)
+```
+
+Assim:
+
+```text
+fixture de teste
+      ↓
+representa o contrato Silver real
+      ↓
+Gold recebe TIMESTAMP
+```
+
+## Por que corrigir o teste e não a Gold?
+
+Porque adicionar um:
+
+```sql
+CAST(event_timestamp AS TIMESTAMP)
+```
+
+apenas para acomodar um fixture incorreto esconderia uma inconsistência do teste.
+
+A fronteira já define:
+
+```text
+Silver
+event_timestamp → TIMESTAMP
+```
+
+Logo o teste deve respeitar esse contrato.
+
+---
+
+# 101. Atualizar a API Arrow utilizada pelo DuckDB
+
+Durante essa mesma etapa foi emitido:
+
+```text
+DeprecationWarning
+
+fetch_arrow_table()
+is deprecated
+```
+
+O código foi atualizado de:
+
+```python
+.fetch_arrow_table()
+```
+
+para:
+
+```python
+.to_arrow_table()
+```
+
+Esse padrão passou a ser utilizado pelos builders Gold seguintes.
+
+O fluxo permanece:
+
+```text
+DuckDB query
+     ↓
+Arrow Table
+     ↓
+futura persistência Delta
+```
+
+---
+
+# 102. Criar `device_last_position`
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── gold/
+        └── last_position.py
+```
+
+A função principal é:
+
+```python
+build_device_last_position(...)
+```
+
+## O que?
+
+O produto retorna:
+
+```text
+no máximo uma posição por device_serial
+```
+
+representando a última posição operacionalmente válida conhecida.
+
+---
+
+# 103. Filtrar posições utilizáveis para `device_last_position`
+
+A origem utilizada é:
+
+```text
+telemetry_gold_base
+```
+
+Antes de escolher a última posição, são mantidas apenas linhas com:
+
+```sql
+has_valid_coordinates = TRUE
+```
+
+Também são descartados pontos:
+
+```text
+latitude  = 0
+longitude = 0
+```
+
+através de:
+
+```sql
+AND NOT (
+    latitude = 0
+    AND longitude = 0
+)
+```
+
+## Para que?
+
+Uma posição `(0, 0)` pode ser matematicamente válida em termos de faixa:
+
+```text
+latitude  ∈ [-90, 90]
+longitude ∈ [-180, 180]
+```
+
+mas não deve substituir a última posição operacional real de um rastreador.
+
+Portanto:
+
+```text
+posição válida anterior
+        ↓
+novo ponto (0, 0)
+        ↓
+Gold ignora
+        ↓
+última posição real permanece
+```
+
+---
+
+# 104. Selecionar a última posição por dispositivo
+
+A escolha utiliza:
+
+```sql
+ROW_NUMBER() OVER (
+    PARTITION BY device_serial
+
+    ORDER BY
+        event_timestamp DESC,
+        server_timestamp DESC NULLS LAST,
+        serial_count DESC NULLS LAST
+)
+```
+
+seguido por:
+
+```sql
+QUALIFY ... = 1
+```
+
+A prioridade é:
+
+```text
+1. event_timestamp mais recente
+2. server_timestamp mais recente
+3. maior serial_count
+```
+
+O produto preserva:
+
+```text
+device_serial
+
+last_position_date
+last_position_at
+received_at
+
+latitude
+longitude
+speed
+direction_degrees
+
+battery_voltage
+internal_battery
+
+odometer_total
+horimeter
+
+hdop
+rx_level
+
+message_type
+report_type
+serial_count
+protocol_version
+position_quality
+source_file
+```
+
+---
+
+# 105. Preparar `device_last_position` para incrementalidade
+
+Assim como a dimensão, o builder aceita:
+
+```python
+affected_devices
+```
+
+e registra:
+
+```text
+affected_position_devices
+```
+
+O filtro final permite recalcular:
+
+```text
+somente dispositivos afetados
+```
+
+em uma execução incremental futura.
+
+O destino previsto será:
+
+```text
+device_last_position
+        ↓
+MERGE
+        ↓
+device_serial
+```
+
+---
+
+# 106. Criar `device_route_points`
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── gold/
+        └── route_points.py
+```
+
+A função principal é:
+
+```python
+build_device_route_points(...)
+```
+
+## O que?
+
+Diferentemente de:
+
+```text
+device_last_position
+```
+
+que mantém somente uma posição atual, `device_route_points` mantém o histórico de posições válidas.
+
+O modelo é:
+
+```text
+device_serial
++
+event_date
++
+sequência de pontos
+```
+
+---
+
+# 107. Filtrar os pontos válidos da rota
+
+Foi criado o CTE:
+
+```sql
+valid_points
+```
+
+Ele exige:
+
+```sql
+has_valid_coordinates = TRUE
+```
+
+e também remove:
+
+```text
+(0, 0)
+```
+
+O `event_date` é derivado de:
+
+```sql
+STRFTIME(
+    event_timestamp,
+    '%Y-%m-%d'
+)
+```
+
+O resultado mantém dados como:
+
+```text
+event_date
+device_serial
+event_timestamp
+received_at
+
+latitude
+longitude
+speed
+direction_degrees
+
+odometer_trip
+odometer_total
+horimeter
+hdop
+rx_level
+
+message_type
+report_type
+serial_count
+protocol_version
+position_quality
+source_file
+```
+
+---
+
+# 108. Sequenciar os pontos de rota
+
+Foi criado:
+
+```sql
+ROW_NUMBER() OVER (
+    PARTITION BY
+        device_serial,
+        event_date
+
+    ORDER BY
+        event_timestamp,
+        received_at NULLS LAST,
+        serial_count NULLS LAST
+)
+```
+
+produzindo:
+
+```text
+point_sequence
+```
+
+Exemplo:
+
+```text
+device 1001
+2026-08-17
+
+10:00 → point_sequence = 1
+11:00 → point_sequence = 2
+12:00 → point_sequence = 3
+```
+
+No próximo dia:
+
+```text
+device 1001
+2026-08-18
+
+08:00 → point_sequence = 1
+```
+
+## Para que?
+
+Permitir reconstrução direta da trajetória:
+
+```text
+ponto 1
+  ↓
+ponto 2
+  ↓
+ponto 3
+  ↓
+...
+```
+
+sem o consumidor precisar ordenar e enumerar toda a telemetria novamente.
+
+---
+
+# 109. Classificar movimento nos pontos de rota
+
+Foi adicionada:
+
+```text
+is_moving
+```
+
+com:
+
+```sql
+COALESCE(
+    speed,
+    0
+) >= 5
+```
+
+A regra é:
+
+```text
+speed < 5
+→ parado
+
+speed >= 5
+→ movimento
+
+speed NULL
+→ tratado como 0
+→ parado
+```
+
+Esse indicador já deixa o produto preparado para consultas de trajetória e análise de movimento.
+
+---
+
+# 110. Preparar `device_route_points` para rebuild por data
+
+O builder aceita:
+
+```python
+event_dates
+```
+
+Quando o argumento é fornecido, é registrada:
+
+```text
+route_gold_dates
+```
+
+A consulta passa a incluir somente:
+
+```text
+datas afetadas
+```
+
+O comportamento planejado é:
+
+```text
+SilverLoadResult
+    │
+    └── affected_event_dates
+              ↓
+Gold
+              ↓
+build_device_route_points(
+    event_dates=...
+)
+              ↓
+replace seletivo
+```
+
+O writer Gold ainda não foi implementado nesta etapa.
+
+---
+
+# 111. Criar `device_daily_summary`
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── gold/
+        └── daily_summary.py
+```
+
+A função principal é:
+
+```python
+build_device_daily_summary(...)
+```
+
+## O que?
+
+Esse é o primeiro produto Gold realmente agregado.
+
+O agrupamento é:
+
+```text
+device_serial
++
+event_date
+```
+
+Portanto:
+
+```text
+uma linha
+=
+resumo de um dispositivo em um dia
+```
+
+---
+
+# 112. Agregar volume e tipos de mensagens por dia
+
+No CTE:
+
+```sql
+daily_aggregated
+```
+
+são calculados:
+
+```sql
+MIN(event_timestamp)
+    AS first_event_at
+
+MAX(event_timestamp)
+    AS last_event_at
+
+COUNT(*)
+    AS message_count
+
+COUNT(DISTINCT message_type)
+    AS distinct_message_type_count
+```
+
+O produto consegue responder diretamente:
+
+```text
+quando o dispositivo começou a enviar eventos no dia?
+quando enviou o último?
+quantos eventos?
+quantos tipos de mensagem diferentes?
+```
+
+---
+
+# 113. Agregar qualidade das posições
+
+Também são calculados:
+
+```text
+valid_position_count
+invalid_position_count
+low_gps_precision_count
+valid_position_percentage
+```
+
+A contagem válida usa:
+
+```sql
+WHERE has_valid_coordinates = TRUE
+```
+
+Enquanto a inválida utiliza:
+
+```sql
+WHERE has_valid_coordinates IS NOT TRUE
+```
+
+O percentual é:
+
+```text
+valid_position_count
+---------------------------- × 100
+message_count
+```
+
+com arredondamento para duas casas.
+
+---
+
+# 114. Agregar movimento e velocidade
+
+Foram adicionadas:
+
+```text
+moving_event_count
+stopped_event_count
+
+average_speed
+average_speed_while_moving
+maximum_speed
+```
+
+A regra permanece:
+
+```text
+speed >= 5
+→ moving
+
+speed < 5
+→ stopped
+```
+
+Porém:
+
+```text
+speed IS NULL
+```
+
+não entra em:
+
+```text
+stopped_event_count
+```
+
+porque a regra exige explicitamente:
+
+```sql
+speed IS NOT NULL
+AND speed < 5
+```
+
+---
+
+# 115. Agregar métricas de GPS e bateria
+
+Também são produzidas:
+
+```text
+average_hdop
+minimum_hdop
+maximum_hdop
+
+minimum_battery_voltage
+maximum_battery_voltage
+average_battery_voltage
+
+minimum_internal_battery
+maximum_internal_battery
+average_internal_battery
+```
+
+## Para que?
+
+Transformar dezenas ou milhares de eventos Silver em métricas diárias prontas para:
+
+```text
+dashboard
+API
+alertas
+MCP
+analytics
+```
+
+---
+
+# 116. Calcular evolução diária do odômetro
+
+O resumo busca:
+
+```text
+first_odometer_total
+last_odometer_total
+```
+
+utilizando o timestamp do evento.
+
+Em seguida:
+
+```text
+odometer_delta_raw
+```
+
+é calculado.
+
+A regra é:
+
+```text
+first = NULL
+ou
+last = NULL
+        ↓
+delta = NULL
+```
+
+Se:
+
+```text
+last >= first
+```
+
+então:
+
+```text
+delta = last - first
+```
+
+---
+
+# 117. Detectar regressão de odômetro
+
+Também foi criado:
+
+```text
+has_odometer_regression
+```
+
+Quando:
+
+```text
+last_odometer_total
+<
+first_odometer_total
+```
+
+o resultado é:
+
+```text
+has_odometer_regression = true
+odometer_delta_raw = NULL
+```
+
+## Para que?
+
+Evitar transformar uma regressão de contador em:
+
+```text
+distância negativa
+```
+
+que poderia ser interpretada como uma medição válida.
+
+O produto sinaliza explicitamente a anomalia.
+
+---
+
+# 118. Armazenar primeira e última posição válida do dia
+
+O resumo diário também produz:
+
+```text
+first_valid_position_at
+last_valid_position_at
+
+first_latitude
+first_longitude
+
+last_latitude
+last_longitude
+```
+
+Somente posições com:
+
+```text
+has_valid_coordinates = TRUE
+```
+
+participam desse cálculo.
+
+Assim, uma telemetria inválida no início ou fim do dia não substitui as posições utilizáveis.
+
+---
+
+# 119. Preparar `device_daily_summary` para incrementalidade
+
+O builder aceita:
+
+```python
+event_dates
+```
+
+Quando informado:
+
+```text
+daily_gold_dates
+```
+
+é registrado no DuckDB.
+
+A agregação é limitada às datas solicitadas.
+
+Isso prepara o fluxo:
+
+```text
+Silver
+affected_event_dates
+        ↓
+Gold
+        ↓
+device_daily_summary
+        ↓
+somente datas afetadas
+        ↓
+replace seletivo
+```
+
+---
+
+# 120. Criar `data_quality_summary`
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── gold/
+        └── quality_summary.py
+```
+
+A função principal é:
+
+```python
+build_data_quality_summary(...)
+```
+
+## O que?
+
+Esse produto mede a qualidade diária do processamento Silver.
+
+Ele combina:
+
+```text
+telemetry_events
+device_identity_events
+rejected_logs
+```
+
+e produz:
+
+```text
+uma linha por metric_date
+```
+
+---
+
+# 121. Não utilizar a base deduplicada para métricas de qualidade
+
+Existe uma diferença importante.
+
+Produtos operacionais utilizam:
+
+```text
+telemetry_gold_base
+identity_gold_base
+```
+
+porque querem eventos logicamente deduplicados.
+
+Porém:
+
+```text
+data_quality_summary
+```
+
+consulta diretamente:
+
+```text
+silver_telemetry
+silver_identity
+silver_rejected
+```
+
+O fluxo é:
+
+```text
+Silver real
+   │
+   ├── telemetry
+   ├── identity
+   └── rejected
+        ↓
+data_quality_summary
+```
+
+## Para que?
+
+A pergunta do produto de qualidade não é:
+
+```text
+quantos eventos lógicos diferentes existiram?
+```
+
+mas:
+
+```text
+quantos registros a Silver aceitou ou rejeitou?
+```
+
+Portanto, deduplicar antes dessa métrica alteraria o volume real processado.
+
+---
+
+# 122. Agregar eventos aceitos
+
+Foi criado:
+
+```sql
+telemetry_counts
+```
+
+que agrupa:
+
+```text
+telemetry_events
+```
+
+por:
+
+```text
+event_date
+```
+
+produzindo:
+
+```text
+telemetry_event_count
+```
+
+Também:
+
+```sql
+identity_counts
+```
+
+produz:
+
+```text
+identity_event_count
+```
+
+O total aceito é:
+
+```text
+accepted_event_count
+=
+telemetry_event_count
++
+identity_event_count
+```
+
+---
+
+# 123. Agregar rejeições e seus motivos
+
+Foi criado:
+
+```sql
+rejected_counts
+```
+
+agrupado por:
+
+```text
+rejection_date
+```
+
+O resultado contém:
+
+```text
+rejected_event_count
+
+missing_message_type_count
+invalid_message_type_count
+invalid_timestamp_count
+missing_device_serial_count
+unknown_rejection_count
+```
+
+Os motivos utilizados correspondem aos motivos definidos pela Silver:
+
+```text
+MISSING_MESSAGE_TYPE
+INVALID_MESSAGE_TYPE
+MISSING_OR_INVALID_TIMESTAMP
+MISSING_DEVICE_SERIAL
+UNKNOWN_REJECTION_REASON
+```
+
+---
+
+# 124. Preservar a partição `unknown` nas métricas de qualidade
+
+A data da rejeição é normalizada através de:
+
+```sql
+COALESCE(
+    CAST(
+        rejection_date
+        AS VARCHAR
+    ),
+    'unknown'
+)
+```
+
+Portanto:
+
+```text
+rejection_date = NULL
+```
+
+é transformado em:
+
+```text
+metric_date = unknown
+```
+
+Da mesma forma, registros Silver já classificados com:
+
+```text
+rejection_date = "unknown"
+```
+
+permanecem nessa mesma categoria.
+
+## Para que?
+
+Manter mensuráveis justamente os registros que não possuem timestamp válido.
+
+Sem isso:
+
+```text
+registro sem data
+→ desaparece das métricas por data
+```
+
+Com:
+
+```text
+unknown
+```
+
+temos:
+
+```text
+registro sem data
+→ continua observável
+```
+
+---
+
+# 125. Construir o conjunto completo de datas de qualidade
+
+Foi criado:
+
+```sql
+all_dates
+```
+
+com:
+
+```text
+datas da telemetria
+UNION
+datas da identidade
+UNION
+datas das rejeições
+```
+
+## Para que?
+
+Uma data pode existir somente em uma das fontes.
+
+Exemplo:
+
+```text
+17/08
+→ somente telemetria
+
+18/08
+→ somente identidade
+
+19/08
+→ somente rejected
+```
+
+O produto precisa gerar:
+
+```text
+17/08
+18/08
+19/08
+```
+
+e preencher métricas ausentes com:
+
+```text
+0
+```
+
+Isso é feito com:
+
+```sql
+COALESCE(..., 0)
+```
+
+---
+
+# 126. Calcular total e percentual de rejeição
+
+Após combinar as fontes:
+
+```text
+accepted_event_count
+=
+telemetry
++
+identity
+```
+
+e:
+
+```text
+total_event_count
+=
+telemetry
++
+identity
++
+rejected
+```
+
+O percentual é:
+
+```text
+rejected_event_count
+----------------------------- × 100
+total_event_count
+```
+
+com:
+
+```sql
+NULLIF(total, 0)
+```
+
+para evitar divisão por zero.
+
+O resultado é armazenado em:
+
+```text
+rejection_percentage
+```
+
+---
+
+# 127. Preparar `data_quality_summary` para incrementalidade
+
+O builder aceita:
+
+```python
+metric_dates
+```
+
+e registra:
+
+```text
+quality_gold_dates
+```
+
+O filtro final permite reconstruir somente métricas específicas.
+
+No futuro, essas datas deverão resultar da união:
+
+```text
+SilverLoadResult
+│
+├── affected_event_dates
+└── affected_rejection_dates
+        │
+        ▼
+quality metric dates
+```
+
+Assim:
+
+```text
+novo evento válido
+→ pode alterar qualidade
+
+nova rejeição
+→ também pode alterar qualidade
+```
+
+---
+
+# 128. Adicionar testes unitários dos produtos Gold
+
+Foram adicionados testes específicos para os produtos implementados.
+
+## `dim_device`
+
+O arquivo:
+
+```text
+tests/unit/test_gold_dim_device.py
+```
+
+cobre cenários como:
+
+```text
+identidade + telemetria
+identidade mais recente
+dispositivo apenas com telemetria
+first_seen / last_seen
+filtro por affected_devices
+```
+
+---
+
+## `device_last_position`
+
+O arquivo:
+
+```text
+tests/unit/test_gold_last_position.py
+```
+
+cobre:
+
+```text
+seleção do evento mais recente
+coordenadas inválidas
+remoção de (0, 0)
+desempate por server_timestamp
+affected_devices
+preservação das métricas de posição
+```
+
+---
+
+## `device_route_points`
+
+O arquivo:
+
+```text
+tests/unit/test_gold_route_points.py
+```
+
+cobre:
+
+```text
+ordem cronológica
+point_sequence
+reset da sequência por device/data
+coordenadas inválidas
+remoção de (0, 0)
+is_moving
+filtro por event_dates
+```
+
+---
+
+## `device_daily_summary`
+
+O arquivo:
+
+```text
+tests/unit/test_gold_daily_summary.py
+```
+
+cobre:
+
+```text
+agregação diária
+qualidade de posições
+movimento e parada
+delta do odômetro
+regressão do odômetro
+primeira/última posição válida
+filtro por event_dates
+```
+
+---
+
+## `data_quality_summary`
+
+O arquivo:
+
+```text
+tests/unit/test_gold_quality_summary.py
+```
+
+cobre:
+
+```text
+aceitos + rejeitados
+motivos de rejeição
+datas provenientes das três fontes
+unknown
+filtro por metric_dates
+contagem direta da Silver
+```
+
+---
+
+# 129. Estado atual dos builders Gold
+
+Neste ponto, o código Gold implementado está organizado em:
+
+```text
+src/
+└── queo_data_platform/
+    │
+    ├── contracts/
+    │   └── gold.py
+    │
+    └── gold/
+        ├── __init__.py
+        ├── base.py
+        ├── dim_device.py
+        ├── last_position.py
+        ├── route_points.py
+        ├── daily_summary.py
+        └── quality_summary.py
+```
+
+A transformação disponível neste momento é:
+
+```text
+Silver
+│
+├── telemetry_events
+├── device_identity_events
+└── rejected_logs
+        │
+        ▼
+DuckDB relations
+        │
+        ├── silver_telemetry
+        ├── silver_identity
+        └── silver_rejected
+        │
+        ▼
+Gold base views
+        │
+        ├── telemetry_gold_base
+        └── identity_gold_base
+        │
+        ▼
+Gold builders
+        │
+        ├── dim_device
+        ├── device_last_position
+        ├── device_route_points
+        ├── device_daily_summary
+        └── data_quality_summary
+        │
+        ▼
+PyArrow Tables
+```
+
+---
+
+# 130. O que ainda não foi implementado na Gold
+
+Embora os cinco produtos já possuam builders, a camada Gold ainda não está completa.
+
+Ainda faltam:
+
+```text
+schemas PyArrow definitivos
+        ↓
+writer Gold
+        ↓
+persistência Delta
+        ↓
+MERGE de tabelas por entidade
+        ↓
+replace seletivo de partições
+        ↓
+descoberta de dispositivos afetados
+        ↓
+service Gold
+        ↓
+FULL / INCREMENTAL / NOOP
+        ↓
+GoldLoadResult
+        ↓
+testes de integração
+```
+
+Portanto:
+
+```text
+Gold transformations
+        ✅
+
+Gold persistence
+        ⏳
+
+Gold orchestration
+        ⏳
+```
+
+---
+
+# 131. Estratégia planejada para persistência Gold
+
+Com os contratos e builders atuais, a persistência deverá seguir dois caminhos.
+
+## Tabelas por entidade
+
+```text
+dim_device
+device_last_position
+```
+
+Estratégia:
+
+```text
+PyArrow
+   ↓
+Delta MERGE
+   ↓
+device_serial
+```
+
+Comportamento desejado:
+
+```text
+device já existe
+→ atualizar estado Gold
+
+device novo
+→ inserir
+```
+
+---
+
+## Tabelas por partição
+
+```text
+device_route_points
+device_daily_summary
+data_quality_summary
+```
+
+Estratégia:
+
+```text
+recalcular partição completa afetada
+        ↓
+overwrite seletivo
+```
+
+Partições:
+
+```text
+route_points
+→ event_date
+
+daily_summary
+→ event_date
+
+quality_summary
+→ metric_date
+```
+
+Essa estratégia mantém o mesmo princípio usado na Silver:
+
+```text
+late-arriving data
+        ↓
+descobrir escopo afetado
+        ↓
+reconstruir estado completo do escopo
+        ↓
+substituir somente esse estado
+```
+
+---
+
+# 132. Ponto atual de desenvolvimento
+
+O projeto está atualmente neste ponto:
+
+```text
+                         QUEO DATA PLATFORM
+
+Raw
+ │
+ ▼
+Bronze                                      ✅
+ │
+ ├── discovery
+ ├── validation
+ ├── lineage
+ ├── control
+ ├── Delta MERGE
+ └── service
+ │
+ ▼
+Silver                                      ✅
+ │
+ ├── normalization
+ ├── classification
+ ├── transformation
+ ├── explicit schemas
+ ├── Delta writer
+ ├── affected partitions
+ ├── late-arriving
+ ├── FULL
+ ├── INCREMENTAL
+ └── NOOP
+ │
+ ▼
+Gold                                        🚧
+ │
+ ├── contracts                              ✅
+ ├── deduplicated base views                ✅
+ │
+ ├── dim_device                             ✅ builder
+ ├── device_last_position                   ✅ builder
+ ├── device_route_points                    ✅ builder
+ ├── device_daily_summary                   ✅ builder
+ └── data_quality_summary                   ✅ builder
+ │
+ ├── Arrow schemas                          ⏳
+ ├── Delta writer                           ⏳
+ ├── incremental orchestration              ⏳
+ └── service                                ⏳
+ │
+ ▼
+Query Layer                                 ⏳
+ │
+ ├── REST API                               ⏳
+ └── MCP                                    ⏳
+```
+
+O desenvolvimento deve continuar a partir de:
+
+```text
+contracts/gold.py
+        ↓
+adicionar schemas Arrow dos cinco produtos
+        ↓
+gold/writer.py
+```
+
+Somente depois da persistência deve ser criado:
+
+```text
+gold/service.py
+```
+
+para não misturar:
+
+```text
+transformação
+persistência
+incrementalidade
+orquestração
+```
+
+em um único módulo.
+
+---
+
+# 133. Próximo passo recomendado
+
+O próximo passo é expandir:
+
+```text
+src/queo_data_platform/contracts/gold.py
+```
+
+com schemas PyArrow explícitos para:
+
+```text
+DIM_DEVICE_SCHEMA
+
+DEVICE_LAST_POSITION_SCHEMA
+
+DEVICE_ROUTE_POINTS_SCHEMA
+
+DEVICE_DAILY_SUMMARY_SCHEMA
+
+DATA_QUALITY_SUMMARY_SCHEMA
+```
+
+## Para que?
+
+A experiência da Silver já demonstrou que inferência automática de schema pode ser problemática, principalmente em:
+
+```text
+DataFrames vazios
+colunas completamente NULL
+rebuilds seletivos
+```
+
+A Gold deve aplicar a mesma regra:
+
+```text
+builder
+    ↓
+Arrow Table
+    ↓
+schema Gold explícito
+    ↓
+Delta
+```
+
+O contrato, e não a inferência dos dados de uma execução específica, deve ser a fonte de verdade para os tipos persistidos.
+
+Depois:
+
+```text
+schemas
+   ↓
+writer
+   ↓
+incremental
+   ↓
+service
+   ↓
+GoldLoadResult
+   ↓
+integração
+```
+
+Esse é o ponto exato para retomada do desenvolvimento.
