@@ -6,6 +6,9 @@ import pandas as pd
 import pyarrow as pa
 from deltalake import DeltaTable, write_deltalake
 
+from queo_data_platform.config.settings import (
+    load_settings,
+)
 from queo_data_platform.contracts.silver import (
     DEVICE_IDENTITY_TABLE_NAME,
     REJECTED_LOGS_TABLE_NAME,
@@ -16,6 +19,7 @@ from queo_data_platform.contracts.tracker import (
     RAW_TRACKER_REQUIRED_COLUMNS,
 )
 from queo_data_platform.silver.service import (
+    load_silver,
     load_silver_data,
 )
 
@@ -291,4 +295,162 @@ def test_late_arriving_batch_rebuilds_only_affected_date(
 
     assert set(day_18["row_id"]) == {
         "row-18",
+    }
+
+
+def test_first_incremental_request_falls_back_to_full(
+    tmp_path: Path,
+) -> None:
+    bronze_dir = tmp_path / "01_bronze"
+    silver_dir = tmp_path / "02_silver"
+
+    write_bronze_rows(
+        bronze_dir,
+        [
+            build_bronze_row(
+                row_id="row-17",
+                batch_id="batch-001",
+                event_date="2026-08-17",
+            ),
+            build_bronze_row(
+                row_id="row-18",
+                batch_id="batch-002",
+                event_date="2026-08-18",
+            ),
+        ],
+    )
+
+    result = load_silver_data(
+        bronze_dir=bronze_dir,
+        silver_dir=silver_dir,
+        batch_ids=("batch-002",),
+    )
+
+    assert result.mode == "FULL"
+
+    assert result.batch_ids == ("batch-002",)
+
+    assert result.affected_event_dates == (
+        "2026-08-17",
+        "2026-08-18",
+    )
+
+    telemetry = DeltaTable(str(silver_dir / TELEMETRY_TABLE_NAME)).to_pandas()
+
+    assert set(telemetry["row_id"]) == {
+        "row-17",
+        "row-18",
+    }
+
+
+def test_incremental_unknown_rebuilds_all_unknown_rows(
+    tmp_path: Path,
+) -> None:
+    bronze_dir = tmp_path / "01_bronze"
+    silver_dir = tmp_path / "02_silver"
+
+    valid_row = build_bronze_row(
+        row_id="valid-row",
+        batch_id="batch-valid",
+        event_date="2026-08-17",
+    )
+
+    old_unknown = build_bronze_row(
+        row_id="old-unknown",
+        batch_id="batch-old",
+        event_date="2026-08-17",
+    )
+
+    old_unknown["TM_STAMP"] = "invalid"
+    old_unknown["DATA_SERVIDOR"] = "invalid"
+
+    write_bronze_rows(
+        bronze_dir,
+        [
+            valid_row,
+            old_unknown,
+        ],
+    )
+
+    # Cria inicialmente as três tabelas Silver.
+    load_silver_data(
+        bronze_dir=bronze_dir,
+        silver_dir=silver_dir,
+    )
+
+    new_unknown = build_bronze_row(
+        row_id="new-unknown",
+        batch_id="batch-new",
+        event_date="2026-08-18",
+    )
+
+    new_unknown["TM_STAMP"] = "invalid"
+    new_unknown["DATA_SERVIDOR"] = "invalid"
+
+    write_bronze_rows(
+        bronze_dir,
+        [
+            new_unknown,
+        ],
+        mode="append",
+    )
+
+    result = load_silver_data(
+        bronze_dir=bronze_dir,
+        silver_dir=silver_dir,
+        batch_ids=("batch-new",),
+    )
+
+    assert result.mode == "INCREMENTAL"
+
+    assert result.affected_event_dates == ()
+
+    assert result.affected_rejection_dates == ("unknown",)
+
+    rejected = DeltaTable(str(silver_dir / REJECTED_LOGS_TABLE_NAME)).to_pandas()
+
+    unknown = rejected.loc[rejected["rejection_date"] == "unknown"]
+
+    assert set(unknown["row_id"]) == {
+        "old-unknown",
+        "new-unknown",
+    }
+
+
+def test_silver_can_run_from_settings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_dir = tmp_path / "data"
+
+    monkeypatch.setenv(
+        "QUEO_DATA_DIR",
+        str(data_dir),
+    )
+
+    settings = load_settings()
+
+    write_bronze_rows(
+        settings.bronze_dir,
+        [
+            build_bronze_row(
+                row_id="row-settings",
+                batch_id="batch-settings",
+                event_date="2026-08-17",
+            )
+        ],
+    )
+
+    result = load_silver(settings)
+
+    assert result.mode == "FULL"
+
+    telemetry_path = settings.silver_dir / TELEMETRY_TABLE_NAME
+
+    assert DeltaTable.is_deltatable(str(telemetry_path))
+
+    telemetry = DeltaTable(str(telemetry_path)).to_pandas()
+
+    assert set(telemetry["row_id"]) == {
+        "row-settings",
     }
