@@ -17,8 +17,8 @@ def dataframe_to_arrow(
     """
     Converte um DataFrame Silver usando schema explícito.
 
-    Isso evita NullType quando uma coluna possui apenas NULL
-    ou quando o resultado possui zero linhas.
+    Isso evita NullType e inferências incorretas de tipo,
+    especialmente quando o produto Silver está vazio.
     """
 
     missing_columns = [
@@ -29,6 +29,27 @@ def dataframe_to_arrow(
         raise ValueError(
             "O DataFrame Silver não possui todas as colunas "
             f"do contrato: {missing_columns}"
+        )
+
+    # Um DataFrame vazio pode ter tipos inferidos incorretamente
+    # por Pandas/DuckDB.
+    #
+    # Exemplo:
+    #
+    # event_date vazio
+    #     -> dtype int32
+    #
+    # embora o contrato Silver determine:
+    #
+    # event_date
+    #     -> string
+    #
+    # Nesse caso criamos diretamente uma tabela Arrow vazia
+    # usando o schema como fonte de verdade.
+    if dataframe.empty:
+        return pa.Table.from_batches(
+            [],
+            schema=schema,
         )
 
     aligned = dataframe.reindex(columns=schema.names)

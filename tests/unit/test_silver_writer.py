@@ -201,3 +201,28 @@ def test_empty_rebuilt_partition_removes_old_rows(
     assert set(dataframe["event_date"]) == {
         "2026-08-18",
     }
+
+
+def test_empty_dataframe_uses_explicit_schema() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "event_date": pd.Series(dtype="int32"),
+            "device_serial": pd.Series(dtype="int32"),
+            "value": pd.Series(dtype="int32"),
+        }
+    )
+
+    table = dataframe_to_arrow(
+        dataframe,
+        TEST_SCHEMA,
+    )
+
+    assert table.num_rows == 0
+
+    assert table.schema == TEST_SCHEMA
+
+    assert table.schema.field("event_date").type == pa.string()
+
+    assert table.schema.field("device_serial").type == pa.string()
+
+    assert table.schema.field("value").type == pa.float64()
