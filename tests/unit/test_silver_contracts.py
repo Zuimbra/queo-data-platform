@@ -1,9 +1,14 @@
+import pyarrow as pa
+
 from queo_data_platform.contracts.silver import (
+    DEVICE_IDENTITY_SCHEMA,
     DEVICE_IDENTITY_TABLE_NAME,
+    REJECTED_LOGS_SCHEMA,
     REJECTED_LOGS_TABLE_NAME,
     SILVER_EVENT_PARTITION_COLUMN,
     SILVER_LINEAGE_COLUMNS,
     SILVER_REJECTION_PARTITION_COLUMN,
+    TELEMETRY_SCHEMA,
     TELEMETRY_TABLE_NAME,
 )
 from queo_data_platform.contracts.tracker import (
@@ -37,3 +42,11 @@ def test_silver_preserves_bronze_lineage_contract() -> None:
         "ingested_at",
         "ingestion_date",
     )
+
+
+def test_silver_partition_columns_are_strings() -> None:
+    assert TELEMETRY_SCHEMA.field("event_date").type == pa.string()
+
+    assert DEVICE_IDENTITY_SCHEMA.field("event_date").type == pa.string()
+
+    assert REJECTED_LOGS_SCHEMA.field("rejection_date").type == pa.string()
