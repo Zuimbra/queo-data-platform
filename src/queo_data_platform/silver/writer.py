@@ -31,21 +31,6 @@ def dataframe_to_arrow(
             f"do contrato: {missing_columns}"
         )
 
-    # Um DataFrame vazio pode ter tipos inferidos incorretamente
-    # por Pandas/DuckDB.
-    #
-    # Exemplo:
-    #
-    # event_date vazio
-    #     -> dtype int32
-    #
-    # embora o contrato Silver determine:
-    #
-    # event_date
-    #     -> string
-    #
-    # Nesse caso criamos diretamente uma tabela Arrow vazia
-    # usando o schema como fonte de verdade.
     if dataframe.empty:
         return pa.Table.from_batches(
             [],
