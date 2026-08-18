@@ -12740,6 +12740,5 @@ PipelineResult
 passará a formar a cadeia completa de processamento da plataforma.
 
 Esse é o ponto exato para retomada do desenvolvimento.
-````
 
-[1]: https://github.com/Zuimbra/queo-data-platform/tree/main/src/queo_data_platform/pipeline "queo-data-platform/src/queo_data_platform/pipeline at main · Zuimbra/queo-data-platform · GitHub"
+
