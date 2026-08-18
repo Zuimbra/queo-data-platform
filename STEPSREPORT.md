@@ -12741,4 +12741,3032 @@ passará a formar a cadeia completa de processamento da plataforma.
 
 Esse é o ponto exato para retomada do desenvolvimento.
 
+# 186. Corrigir a semântica de `batch_ids=()` na Silver
+
+## O que?
+
+Antes de criar a orquestração completa do pipeline, foi corrigida a interpretação de:
+
+```python
+batch_ids=()
+```
+
+em:
+
+```text
+src/queo_data_platform/silver/service.py
+```
+
+Até então, a Silver utilizava conceitualmente:
+
+```python
+requested_incremental = bool(normalized_batch_ids)
+```
+
+Isso fazia com que:
+
+```python
+batch_ids=()
+```
+
+fosse interpretado como:
+
+```python
+requested_incremental = False
+```
+
+e, consequentemente:
+
+```text
+FULL
+```
+
+## Para que?
+
+No fluxo futuro:
+
+```text
+Bronze
+   ↓
+BronzeLoadResult.batch_ids
+   ↓
+Silver
+```
+
+uma execução sem arquivos novos produz:
+
+```python
+batch_ids = ()
+```
+
+Isso significa:
+
+> não existem novos batches
+
+e não:
+
+> reconstrua toda a Silver
+
+Sem essa correção, uma execução ociosa do pipeline poderia causar rebuild completo da Silver.
+
+## Como?
+
+A decisão passou a separar explicitamente quatro situações:
+
+```text
+batch_ids is None
+        ↓
+FULL explícito
+
+batch_ids == ()
++
+Silver completa
+        ↓
+NOOP
+
+batch_ids == ()
++
+Silver ausente ou incompleta
+        ↓
+FULL de recuperação
+
+batch_ids contém valores
++
+Silver completa
+        ↓
+INCREMENTAL
+```
+
+Portanto:
+
+```text
+None ≠ ()
+```
+
+A primeira representação significa:
+
+```text
+rebuild solicitado
+```
+
+A segunda significa:
+
+```text
+nenhum batch novo
+```
+
+Essa distinção fecha a semântica necessária para a futura orquestração ponta a ponta.
+
+---
+
+# 187. Fixar o comportamento `batch_ids=()` com teste de integração
+
+## O que?
+
+Foi adicionado um cenário específico aos testes de integração da Silver.
+
+O teste executa inicialmente uma Silver válida e depois chama novamente a camada utilizando:
+
+```python
+batch_ids=()
+```
+
+O resultado esperado é:
+
+```text
+mode = NOOP
+```
+
+com:
+
+```text
+telemetry_rows_written = 0
+identity_rows_written = 0
+rejected_rows_written = 0
+```
+
+## Para que?
+
+A diferença entre:
+
+```text
+FULL
+```
+
+e:
+
+```text
+NOOP
+```
+
+não poderia permanecer apenas implícita no código.
+
+Ela precisava ser fixada por teste porque será utilizada diretamente pela camada de pipeline.
+
+O cenário protegido passa a ser:
+
+```text
+Silver saudável
++
+nenhum batch novo
+        ↓
+nenhuma escrita
+```
+
+---
+
+# 188. Criar a orquestração Bronze → Silver → Gold
+
+## O que?
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── pipeline/
+        └── service.py
+```
+
+com:
+
+```text
+PipelineResult
+run_pipeline(...)
+```
+
+## Para que?
+
+Bronze, Silver e Gold já possuíam serviços públicos isolados:
+
+```python
+load_bronze(...)
+load_silver(...)
+load_gold(...)
+```
+
+Faltava uma única operação capaz de conectar as três camadas.
+
+O objetivo não era duplicar lógica interna.
+
+O pipeline deve somente coordenar os contratos existentes.
+
+## Como?
+
+O fluxo implementado passou a ser:
+
+```text
+run_pipeline(settings)
+        │
+        ▼
+load_bronze(settings)
+        │
+        ▼
+BronzeLoadResult
+        │
+        └── batch_ids
+                │
+                ▼
+load_silver(
+    settings,
+    batch_ids=...
+)
+        │
+        ▼
+SilverLoadResult
+        │
+        ▼
+load_gold(
+    settings,
+    silver_result=...
+)
+        │
+        ▼
+GoldLoadResult
+        │
+        ▼
+PipelineResult
+```
+
+O pipeline não conhece detalhes como:
+
+* SHA-256;
+* schema CSV;
+* `MERGE` Bronze;
+* regras T1;
+* DuckDB;
+* partições Silver;
+* partições Gold.
+
+Essas responsabilidades permanecem encapsuladas nas respectivas camadas.
+
+---
+
+# 189. Criar `PipelineResult`
+
+## O que?
+
+A execução completa passou a retornar:
+
+```text
+PipelineResult
+```
+
+contendo:
+
+```text
+bronze
+silver
+gold
+```
+
+ou seja:
+
+```text
+BronzeLoadResult
+SilverLoadResult
+GoldLoadResult
+```
+
+## Para que?
+
+O chamador do pipeline precisa conseguir inspecionar a execução sem acessar internamente cada módulo.
+
+Foram também expostas propriedades como:
+
+```text
+has_new_data
+has_changes
+```
+
+## Como?
+
+Conceitualmente:
+
+```text
+PipelineResult
+│
+├── bronze
+│   └── arquivos / batches / linhas
+│
+├── silver
+│   └── modo / partições / linhas
+│
+└── gold
+    └── modo / dispositivos / produtos
+```
+
+Assim, o pipeline cria uma fronteira única para futuros consumidores como:
+
+* CLI;
+* scheduler;
+* API administrativa;
+* observabilidade.
+
+---
+
+# 190. Criar testes ponta a ponta do pipeline
+
+## O que?
+
+Foi criado:
+
+```text
+tests/
+└── integration/
+    └── test_pipeline_service.py
+```
+
+Os testes passaram a representar diferentes estados da plataforma.
+
+Foram cobertos inicialmente:
+
+* primeira execução com arquivo;
+* execução posterior sem arquivos;
+* novo arquivo após estado existente.
+
+## Para que?
+
+Era necessário confirmar que a propagação de contexto realmente funcionava entre todas as camadas.
+
+O principal fluxo validado é:
+
+```text
+arquivo
+   ↓
+Bronze
+   ↓
+batch_id
+   ↓
+Silver
+   ↓
+affected dates
+   ↓
+Gold
+```
+
+Também precisava ser confirmado que:
+
+```text
+novo arquivo
+```
+
+não provocava:
+
+```text
+FULL global
+```
+
+quando a plataforma já estivesse preparada para incrementalidade.
+
+---
+
+# 191. Encontrar incompatibilidade Pandas → PyArrow em coluna totalmente nula
+
+## O que?
+
+O primeiro teste ponta a ponta encontrou um erro real durante a escrita Silver.
+
+O problema ocorreu em uma coluna declarada no contrato como:
+
+```text
+string
+```
+
+mas materializada pelo Pandas/DuckDB como:
+
+```text
+Int32
+```
+
+quando todos os valores da coluna eram:
+
+```text
+NULL
+```
+
+Um exemplo concreto foi:
+
+```text
+driver_id
+```
+
+O erro resultante foi equivalente a:
+
+```text
+ArrowTypeError:
+Expected string or bytes dtype,
+got int32
+```
+
+## Por que isso aconteceu?
+
+O contrato Silver estava correto:
+
+```text
+driver_id
+→ pa.string()
+```
+
+Porém, a inferência intermediária do Pandas não possuía informação suficiente quando a coluna inteira era nula.
+
+Assim:
+
+```text
+contrato
+string
+```
+
+chegava à fronteira Arrow como:
+
+```text
+Series[Int32]
+```
+
+mesmo sem nenhum valor inteiro real.
+
+## Consequência
+
+Isso demonstrou que apenas fornecer:
+
+```python
+schema=schema
+```
+
+para:
+
+```python
+pa.Table.from_pandas(...)
+```
+
+não era robusto o suficiente para todos os casos.
+
+---
+
+# 192. Tornar `dataframe_to_arrow()` orientado pelo schema campo a campo
+
+## O que?
+
+A conversão Silver para Arrow foi reforçada.
+
+Em vez de depender de uma única conversão global do DataFrame, a função passou a iterar pelos campos do schema.
+
+## Para que?
+
+O schema declarado deve ser a fonte de verdade.
+
+Especialmente para:
+
+```text
+colunas totalmente NULL
+```
+
+o tipo não deve depender do `dtype` temporariamente escolhido pelo Pandas.
+
+## Como?
+
+A estratégia passa a ser conceitualmente:
+
+```text
+DataFrame
+   ↓
+reindex segundo schema.names
+   ↓
+para cada field
+   │
+   ├── coluna toda NULL
+   │       ↓
+   │   pa.nulls(
+   │       tipo=field.type
+   │   )
+   │
+   └── coluna com valores
+           ↓
+       pa.array(
+           type=field.type,
+           safe=True
+       )
+   ↓
+pa.Table.from_arrays(...)
+```
+
+Assim:
+
+```text
+Pandas Int32
++
+100% NULL
++
+contrato pa.string()
+        ↓
+Arrow string NULL
+```
+
+A conversão passa a obedecer explicitamente ao contrato.
+
+---
+
+# 193. Corrigir validação estática da detecção de coluna totalmente nula
+
+## O que?
+
+Depois da correção anterior, o Pyright apontou ambiguidade na expressão:
+
+```python
+column.isna().all()
+```
+
+O tipo inferido poderia ser:
+
+```text
+Series | bool | Unknown
+```
+
+## Como?
+
+A verificação foi tornada explicitamente NumPy:
+
+```python
+column.isna().to_numpy().all()
+```
+
+## Para que?
+
+Manter simultaneamente:
+
+```text
+runtime correto
++
+type checking correto
+```
+
+sem utilizar:
+
+```text
+type: ignore
+```
+
+ou desabilitar validações.
+
+---
+
+# 194. Criar uma interface de linha de comando para executar o pipeline
+
+## O que?
+
+Foi criado:
+
+```text
+src/queo_data_platform/cli.py
+```
+
+Também foi criado:
+
+```text
+src/queo_data_platform/__main__.py
+```
+
+e adicionado um entry point ao:
+
+```text
+pyproject.toml
+```
+
+## Para que?
+
+Até esse momento, a plataforma podia ser executada através de chamadas Python.
+
+Era necessário ter um comando operacional simples:
+
+```powershell
+uv run queo-data-platform
+```
+
+## Como?
+
+O entry point chama:
+
+```python
+run_pipeline(settings)
+```
+
+e depois apresenta um resumo da execução.
+
+Exemplo conceitual:
+
+```text
+[BRONZE]
+discovered_files
+successful_files
+failed_files
+inserted_rows
+batches
+
+[SILVER]
+mode
+telemetry_rows
+identity_rows
+rejected_rows
+
+[GOLD]
+mode
+affected_devices
+rows por produto
+
+[PIPELINE]
+has_new_data
+has_changes
+```
+
+Também passou a ser possível executar:
+
+```powershell
+uv run python -m queo_data_platform
+```
+
+---
+
+# 195. Encontrar o caso de bootstrap vazio do pipeline
+
+## O que?
+
+A primeira execução real do CLI foi realizada em um ambiente sem:
+
+```text
+01_bronze/tracker_logs
+```
+
+e sem arquivo novo no:
+
+```text
+data/raw/inbox
+```
+
+A Bronze executou corretamente sem produzir dados.
+
+Porém, o pipeline continuou para a Silver.
+
+A Silver tentou carregar:
+
+```text
+data/lakehouse/01_bronze/tracker_logs
+```
+
+e lançou:
+
+```text
+FileNotFoundError
+```
+
+## Para que esse erro foi importante?
+
+O erro revelou uma diferença entre:
+
+```text
+pipeline em repouso
+```
+
+e:
+
+```text
+camada Silver chamada diretamente sem sua fonte
+```
+
+A Silver está correta em rejeitar uma chamada sem Bronze.
+
+A responsabilidade de reconhecer:
+
+```text
+primeira execução
++
+nenhum dado disponível
+```
+
+pertence ao pipeline.
+
+---
+
+# 196. Adicionar bootstrap NOOP quando ainda não existe Bronze
+
+## O que?
+
+O pipeline passou a verificar se:
+
+```text
+01_bronze/tracker_logs
+```
+
+é uma Delta Table válida depois da execução da Bronze.
+
+Se ela ainda não existir:
+
+```text
+Silver
+→ NOOP
+
+Gold
+→ NOOP
+```
+
+## Para que?
+
+Permitir que a aplicação seja executada em uma instalação nova sem exigir dados previamente carregados.
+
+O comportamento correto passa a ser:
+
+```text
+instalação nova
++
+inbox vazio
+        ↓
+Bronze: nenhum arquivo
+        ↓
+Bronze Delta inexistente
+        ↓
+Silver NOOP
+        ↓
+Gold NOOP
+        ↓
+pipeline encerra normalmente
+```
+
+## Decisão arquitetural
+
+A Silver não foi flexibilizada para aceitar fonte inexistente.
+
+A regra continua:
+
+```text
+Silver chamada diretamente
++
+Bronze inexistente
+        ↓
+erro
+```
+
+Somente o orquestrador sabe interpretar o cenário de bootstrap vazio.
+
+---
+
+# 197. Fixar o bootstrap vazio em teste de integração
+
+## O que?
+
+Foi criado o cenário:
+
+```text
+ambiente temporário vazio
++
+sem Bronze
++
+sem arquivos
+```
+
+O resultado esperado é:
+
+```text
+Bronze
+discovered_file_count = 0
+
+Silver
+mode = NOOP
+
+Gold
+mode = NOOP
+
+Pipeline
+has_new_data = False
+has_changes = False
+```
+
+Também é verificado que:
+
+```text
+tracker_logs
+```
+
+não foi criado artificialmente.
+
+## Para que?
+
+Evitar resolver o bootstrap gerando uma Delta Table Bronze vazia apenas para satisfazer dependências.
+
+A ausência de dados deve continuar representada como ausência de tabela até existir a primeira ingestão real.
+
+---
+
+# 198. Validar o CLI em ambiente vazio
+
+## O que?
+
+Depois do tratamento anterior foi executado:
+
+```powershell
+uv run queo-data-platform
+```
+
+em um ambiente sem dados.
+
+A execução passou a encerrar normalmente.
+
+O resultado observado foi equivalente a:
+
+```text
+Bronze
+→ 0 arquivos
+
+Silver
+→ NOOP
+
+Gold
+→ NOOP
+
+has_new_data=False
+has_changes=False
+```
+
+## Para que?
+
+Essa execução confirmou que:
+
+```text
+CLI
++
+pipeline
++
+bootstrap
+```
+
+estavam integrados corretamente.
+
+A plataforma passou a poder ser executada mesmo quando não existe trabalho novo.
+
+---
+
+# 199. Criar um CSV controlado para validar o primeiro processamento completo
+
+## O que?
+
+Foi criado temporariamente:
+
+```text
+scripts/create_test_tracker.py
+```
+
+para gerar um CSV compatível com o contrato Bronze.
+
+O arquivo produzido continha três registros controlados:
+
+1. uma telemetria válida;
+2. uma identidade T1 válida;
+3. um registro inválido.
+
+## Para que?
+
+Antes de utilizar os logs históricos reais, era importante confirmar o fluxo ponta a ponta com um conjunto pequeno e previsível.
+
+A expectativa era:
+
+```text
+3 linhas Bronze
+        ↓
+1 telemetry
+1 identity
+1 rejected
+```
+
+Isso permite detectar erros de integração sem a complexidade de dezenas de milhares de linhas reais.
+
+---
+
+# 200. Validar a primeira execução FULL ponta a ponta
+
+## O que?
+
+O CSV controlado foi colocado em:
+
+```text
+data/raw/inbox
+```
+
+e executado através de:
+
+```powershell
+uv run queo-data-platform
+```
+
+O resultado foi:
+
+```text
+[BRONZE]
+discovered_files=1
+successful_files=1
+failed_files=0
+inserted_rows=3
+propagated_batches=1
+```
+
+Silver:
+
+```text
+mode=FULL
+telemetry_rows=1
+identity_rows=1
+rejected_rows=1
+affected_event_dates=1
+affected_rejection_dates=1
+```
+
+Gold:
+
+```text
+mode=FULL
+affected_devices=1
+dim_device_rows=1
+last_position_rows=1
+route_points_rows=1
+daily_summary_rows=1
+quality_summary_rows=1
+```
+
+## Para que?
+
+Essa foi a primeira confirmação real de:
+
+```text
+arquivo
+  ↓
+Bronze
+  ↓
+Silver
+  ↓
+Gold
+```
+
+através de uma única interface executável.
+
+---
+
+# 201. Confirmar a criação física das oito Delta Tables de dados
+
+## O que?
+
+Depois da primeira execução foram inspecionados os diretórios.
+
+Bronze:
+
+```text
+01_bronze/
+└── tracker_logs
+```
+
+Silver:
+
+```text
+02_silver/
+├── telemetry_events
+├── device_identity_events
+└── rejected_logs
+```
+
+Gold:
+
+```text
+03_gold/
+├── data_quality_summary
+├── device_daily_summary
+├── device_last_position
+├── device_route_points
+└── dim_device
+```
+
+## Para que?
+
+Não bastava o serviço retornar contadores corretos.
+
+Era necessário confirmar que os produtos realmente estavam persistidos no Lakehouse.
+
+---
+
+# 202. Validar NOOP imediatamente após a primeira carga
+
+## O que?
+
+O comando:
+
+```powershell
+uv run queo-data-platform
+```
+
+foi executado novamente sem adicionar nenhum arquivo novo.
+
+O resultado foi:
+
+```text
+Bronze
+discovered_files=0
+
+Silver
+mode=NOOP
+
+Gold
+mode=NOOP
+
+Pipeline
+has_new_data=False
+has_changes=False
+```
+
+A execução foi repetida e permaneceu `NOOP`.
+
+## Para que?
+
+Confirmar operacionalmente que o pipeline não realiza rebuild quando nada mudou.
+
+Assim:
+
+```text
+FULL inicial
+     ↓
+estado persistido
+     ↓
+inbox vazio
+     ↓
+NOOP
+```
+
+passou a estar validado fora dos testes automatizados.
+
+---
+
+# 203. Utilizar o estado existente para validar carga histórica incremental
+
+## O que?
+
+Depois de validar:
+
+```text
+FULL
+```
+
+e:
+
+```text
+NOOP
+```
+
+os logs históricos anteriormente utilizados no projeto foram colocados no fluxo de ingestão.
+
+A camada já possuía estado Bronze, Silver e Gold.
+
+Portanto, esses arquivos permitiriam validar o terceiro cenário:
+
+```text
+INCREMENTAL
+```
+
+## Para que?
+
+Um pequeno CSV artificial prova integração funcional.
+
+Porém, uma carga histórica real permite verificar:
+
+* múltiplos arquivos;
+* alto volume;
+* variações de protocolo;
+* dados inválidos;
+* quarantine;
+* múltiplas datas;
+* múltiplos dispositivos;
+
+sem reinicializar o Lakehouse.
+
+---
+
+# 204. Validar carga real incremental em grande volume
+
+## O que?
+
+Foi executado:
+
+```powershell
+uv run queo-data-platform
+```
+
+com 74 arquivos históricos no inbox.
+
+O resultado da Bronze foi:
+
+```text
+discovered_files=74
+successful_files=73
+skipped_files=0
+failed_files=1
+inserted_rows=87886
+duplicate_rows=0
+propagated_batches=73
+```
+
+A Silver executou:
+
+```text
+mode=INCREMENTAL
+telemetry_rows=12822
+identity_rows=804
+rejected_rows=74260
+affected_event_dates=93
+affected_rejection_dates=94
+```
+
+A Gold executou:
+
+```text
+mode=INCREMENTAL
+affected_devices=3
+dim_device_rows=3
+last_position_rows=2
+route_points_rows=12790
+daily_summary_rows=60
+quality_summary_rows=94
+```
+
+## Para que?
+
+Essa execução confirmou que uma grande carga nova não força automaticamente:
+
+```text
+Silver FULL
+Gold FULL
+```
+
+A cadeia utilizou corretamente:
+
+```text
+73 novos batches
+        ↓
+Silver incremental
+        ↓
+datas afetadas
+        ↓
+Gold incremental
+```
+
+Assim, os três modos principais passaram a estar demonstrados operacionalmente:
+
+```text
+FULL         ✅
+NOOP         ✅
+INCREMENTAL  ✅
+```
+
+---
+
+# 205. Investigar o arquivo que falhou na Bronze
+
+## O que?
+
+A tabela de controle:
+
+```text
+00_control/ingestion_files
+```
+
+foi consultada para identificar o único:
+
+```text
+FAILED
+```
+
+O arquivo era:
+
+```text
+logs_rastreador_2026-02-24.csv
+```
+
+com:
+
+```text
+stage = BRONZE
+status_reason = VALIDATION_FAILED
+```
+
+e mensagem:
+
+```text
+O arquivo não possui todas as colunas obrigatórias.
+```
+
+O arquivo havia sido corretamente movido para:
+
+```text
+data/raw/quarantine
+```
+
+## Para que?
+
+Antes de considerar essa falha um problema da plataforma, era necessário distinguir:
+
+```text
+erro do pipeline
+```
+
+de:
+
+```text
+entrada estruturalmente incompatível
+```
+
+---
+
+# 206. Descobrir que o arquivo de 24/02 pertence a outro formato de captura
+
+## O que?
+
+A inspeção das primeiras linhas mostrou conteúdo como:
+
+```text
+2026-02-24 15:11:16,[RX] RAW:,[2026-02-24 15:11:15,T1,1,V14.06.111,...]
+```
+
+Não existe nesse arquivo o header canônico:
+
+```text
+DATA_SERVIDOR
+TIPO_LOG
+TM_STAMP
+MESS_TYPE
+...
+```
+
+Quando o Pandas tenta tratá-lo como CSV tabular normal, a primeira mensagem passa a ser interpretada como cabeçalho.
+
+## Consequência
+
+Todas as 37 colunas obrigatórias parecem ausentes.
+
+Isso não representa uma simples diferença de nome.
+
+O arquivo pertence a uma representação anterior/bruta do log.
+
+## Decisão
+
+Não flexibilizar a Bronze.
+
+A Bronze continuará exigindo seu contrato estrutural.
+
+Caso esse formato precise ser recuperado futuramente, o fluxo correto será:
+
+```text
+raw legado sem header
+        ↓
+parser/adaptador específico
+        ↓
+estrutura canônica
+        ↓
+Bronze
+```
+
+e não:
+
+```text
+Bronze
+→ tenta adivinhar qualquer formato
+```
+
+Portanto:
+
+```text
+quarantine
+```
+
+foi considerada a resposta correta nesse caso.
+
+---
+
+# 207. Investigar o volume elevado de rejeições Silver
+
+## O que?
+
+A carga histórica produziu:
+
+```text
+74260
+```
+
+novas linhas em:
+
+```text
+rejected_logs
+```
+
+Esse volume era grande demais para ser aceito sem investigação.
+
+Foi consultada a distribuição por:
+
+```text
+rejection_reason
+```
+
+O estado observado foi:
+
+```text
+MISSING_DEVICE_SERIAL    55217
+MISSING_MESSAGE_TYPE     18771
+INVALID_MESSAGE_TYPE       273
+```
+
+## Para que?
+
+O objetivo não era simplesmente reduzir o número de rejeições.
+
+Era necessário descobrir se:
+
+```text
+os registros realmente eram inválidos
+```
+
+ou se:
+
+```text
+o contrato atual não representava corretamente dados históricos válidos
+```
+
+---
+
+# 208. Identificar arquivos responsáveis pelas principais rejeições
+
+## O que?
+
+As rejeições foram agrupadas por:
+
+```text
+rejection_reason
++
+source_file
+```
+
+Foi identificado que alguns arquivos concentravam grandes volumes.
+
+Exemplo:
+
+```text
+logs_rastreador_2026-03-18.csv
+```
+
+possuía:
+
+```text
+16346
+MISSING_MESSAGE_TYPE
+```
+
+e também milhares de:
+
+```text
+MISSING_DEVICE_SERIAL
+```
+
+## Para que?
+
+Uma concentração por arquivo sugere:
+
+* mudança de formato;
+* problema de origem;
+* diferença histórica de protocolo;
+
+mais do que erros aleatórios linha a linha.
+
+---
+
+# 209. Corrigir o diagnóstico para utilizar `device_serial_raw`
+
+## O que?
+
+Durante a investigação foi tentada uma consulta utilizando:
+
+```text
+device_serial
+```
+
+em:
+
+```text
+rejected_logs
+```
+
+Essa coluna não pertence ao produto de rejeição.
+
+O contrato preserva:
+
+```text
+device_serial_raw
+```
+
+## Para que?
+
+Essa diferença reforça uma característica importante da Silver.
+
+Em registros rejeitados:
+
+```text
+valor recebido da origem
+```
+
+deve permanecer distinguível de:
+
+```text
+valor de identidade interpretado/resolvido
+```
+
+Essa distinção se tornaria ainda mais importante na investigação seguinte.
+
+---
+
+# 210. Confirmar que parte de `MISSING_MESSAGE_TYPE` é tráfego externo ao protocolo
+
+## O que?
+
+Foram inspecionados registros e arquivos associados a:
+
+```text
+MISSING_MESSAGE_TYPE
+```
+
+Em:
+
+```text
+logs_rastreador_2026-06-17.csv
+```
+
+foram encontrados payloads como:
+
+```http
+GET / HTTP/1.1
+```
+
+com:
+
+```text
+Host
+User-Agent
+Accept
+Accept-Encoding
+```
+
+Também apareceram assinaturas como:
+
+```text
+PING
+MQTT
+OPTIONS / RTSP/1.0
+```
+
+além de:
+
+* payloads binários;
+* strings aleatórias;
+* scanners de serviços;
+* requisições para protocolos externos.
+
+## Interpretação
+
+Esses registros não representam mensagens válidas do rastreador.
+
+O processo de captura recebeu tráfego externo na mesma interface/porta utilizada para os dispositivos.
+
+## Decisão
+
+Essas linhas devem continuar fora de:
+
+```text
+telemetry_events
+device_identity_events
+```
+
+Portanto, a rejeição permanece correta.
+
+Futuramente, o motivo pode ser refinado para algo como:
+
+```text
+NON_TRACKER_PAYLOAD
+```
+
+mas essa melhoria não é necessária para corrigir a classificação atual.
+
+---
+
+# 211. Descobrir que `MISSING_DEVICE_SERIAL` possui natureza diferente
+
+## O que?
+
+Os registros com:
+
+```text
+MISSING_DEVICE_SERIAL
+```
+
+foram analisados separadamente.
+
+Diferentemente dos payloads HTTP/binários, muitos possuíam:
+
+* timestamp válido;
+* `message_type` válido;
+* `protocol_version` válido;
+* campos de telemetria coerentes.
+
+Foram encontrados tipos como:
+
+```text
+T1
+T2
+T3
+T9
+T10
+T14
+T17
+T21
+T23
+T24
+T27
+T28
+T31
+T47
+```
+
+## Para que?
+
+Isso mostrou que:
+
+```text
+serial ausente
+```
+
+não significava necessariamente:
+
+```text
+registro sem estrutura de tracker
+```
+
+Uma segunda hipótese precisava ser investigada:
+
+```text
+o protocolo histórico não transportava
+o serial na mesma posição
+```
+
+---
+
+# 212. Descobrir concentração de serial ausente no protocolo `V14.06.111`
+
+## O que?
+
+As rejeições por serial ausente foram agrupadas por:
+
+```text
+protocol_version
+```
+
+O resultado foi:
+
+```text
+V14.06.111    55101
+V14.06.117      108
+1                 8
+```
+
+## Interpretação
+
+A associação é extremamente concentrada.
+
+Dos:
+
+```text
+55217
+```
+
+registros com serial ausente:
+
+```text
+55101
+```
+
+pertencem ao:
+
+```text
+V14.06.111
+```
+
+## Para que?
+
+Esse resultado praticamente descartou a hipótese de uma falha genérica da Silver.
+
+O problema passou a estar ligado principalmente à representação histórica do protocolo.
+
+---
+
+# 213. Identificar T14 como principal mensagem afetada
+
+## O que?
+
+O cruzamento entre:
+
+```text
+protocol_version
++
+message_type
+```
+
+mostrou, no `V14.06.111`:
+
+```text
+T14    52592
+T3       794
+T27      290
+T28      196
+T1       161
+T17      136
+T15      136
+T24      133
+T21      104
+...
+```
+
+## Para que?
+
+A enorme concentração em:
+
+```text
+T14
+```
+
+mostrou que o volume de rejeição não era formado por dezenas de milhares de tipos arbitrários.
+
+Existia um padrão operacional repetitivo e consistente.
+
+---
+
+# 214. Inspecionar diretamente o formato `V14.06.111`
+
+## O que?
+
+O arquivo:
+
+```text
+logs_rastreador_2026-03-18.csv
+```
+
+foi inspecionado diretamente.
+
+Exemplos encontrados:
+
+```text
+2026-03-18 00:19:46,[RX] RAW,2026-03-18 00:19:46,T14,1,V14.06.111,,77,13.31
+```
+
+e:
+
+```text
+2026-03-18 00:20:14,[RX] RAW,2026-03-18 00:19:02,T2,1,V14.06.111,,77,13.31,852,-3.827969,-38.533058,...
+```
+
+Depois de:
+
+```text
+V14.06.111
+```
+
+o campo correspondente a:
+
+```text
+S/N ou IMEI
+```
+
+está vazio.
+
+Mesmo assim, a mensagem continua contendo dados coerentes de protocolo.
+
+## Comparação
+
+No protocolo mais novo foram encontradas linhas como:
+
+```text
+T23,1,V14.06.117,202527000021P,...
+```
+
+Ou seja:
+
+```text
+V14.06.117
+→ serial presente
+```
+
+enquanto:
+
+```text
+V14.06.111
+→ serial frequentemente ausente
+```
+
+---
+
+# 215. Confirmar arquivo histórico inteiro sem serial explícito
+
+## O que?
+
+Foi analisado:
+
+```text
+logs_rastreador_2026-03-18.csv
+```
+
+O arquivo possuía:
+
+```text
+18177 linhas
+```
+
+A distribuição mostrou:
+
+```text
+S/N ou IMEI
+→ vazio nas 18177 linhas
+```
+
+Também foram observadas:
+
+```text
+16346 linhas
+```
+
+sem:
+
+```text
+MESS_TYPE
+```
+
+## Para que?
+
+Isso demonstrou que o problema não podia ser tratado apenas como:
+
+```text
+algumas mensagens individuais perderam serial
+```
+
+O arquivo representa um período/formato em que a identidade não era registrada diretamente no campo esperado.
+
+---
+
+# 216. Encontrar identidade indireta nas mensagens T1 legadas
+
+## O que?
+
+Apesar de o serial estar vazio, mensagens:
+
+```text
+T1
+```
+
+do protocolo:
+
+```text
+V14.06.111
+```
+
+preservavam informações de identidade.
+
+Exemplo:
+
+```text
+T1,1,V14.06.111,,,89551180357000580854,12345678,724118041016833,354173560222769
+```
+
+Na interpretação já utilizada pela Silver para T1:
+
+```text
+BAT_VOLT
+→ ICCID
+
+LOC_STATUS
+→ campo auxiliar
+
+LAT
+→ IMSI
+
+LONT
+→ IMEI
+```
+
+Assim, o T1 histórico continha:
+
+```text
+IMEI = 354173560222769
+```
+
+mesmo sem:
+
+```text
+device_serial
+```
+
+## Para que?
+
+Isso forneceu uma possível ponte de identidade entre:
+
+```text
+protocolo histórico
+```
+
+e:
+
+```text
+identidade conhecida posteriormente
+```
+
+---
+
+# 217. Verificar quantos IMEIs aparecem nos arquivos legados
+
+## O que?
+
+Foram selecionadas mensagens:
+
+```text
+T1
++
+V14.06.111
+```
+
+e analisado:
+
+```text
+LONT
+```
+
+como IMEI legado.
+
+A primeira contagem indicou:
+
+```text
+1 IMEI → 21 arquivos
+2 valores → 2 arquivos
+```
+
+## Investigação
+
+Os dois casos aparentemente ambíguos continham, na realidade:
+
+```text
+um valor vazio
++
+um IMEI válido
+```
+
+O valor vazio não havia sido eliminado porque:
+
+```text
+string vazia ≠ NaN
+```
+
+Ao filtrar somente valores válidos no formato:
+
+```regex
+\d{15}
+```
+
+os arquivos passaram a apresentar uma única identidade válida.
+
+---
+
+# 218. Confirmar 23 arquivos históricos com o mesmo IMEI válido
+
+## O que?
+
+Depois de validar o formato de IMEI:
+
+```regex
+\d{15}
+```
+
+foram encontrados:
+
+```text
+23 arquivos
+```
+
+do protocolo legado contendo:
+
+```text
+legacy_imei = 354173560222769
+```
+
+Os arquivos vão desde:
+
+```text
+logs_rastreador_2026-02-26.csv
+```
+
+até registros posteriores de março, incluindo:
+
+```text
+logs_rastreador_2026-03-26.csv
+```
+
+## Para que?
+
+Isso mostrou que o contexto histórico não era aleatório.
+
+Diversos arquivos consecutivos apontavam consistentemente para:
+
+```text
+354173560222769
+```
+
+---
+
+# 219. Cruzar o IMEI legado com identidades modernas da Silver
+
+## O que?
+
+Foi consultado:
+
+```text
+device_identity_events
+```
+
+para obter relações já conhecidas entre:
+
+```text
+device_serial
+IMEI
+IMSI
+ICCID
+```
+
+Foram encontradas associações como:
+
+```text
+device_serial
+202527000021P
+
+IMEI
+354173560222769
+```
+
+e:
+
+```text
+device_serial
+202527000022
+
+IMEI
+354173560218841
+```
+
+## Conclusão
+
+O IMEI histórico:
+
+```text
+354173560222769
+```
+
+corresponde de maneira consistente ao dispositivo:
+
+```text
+202527000021P
+```
+
+## Para que?
+
+Isso fornece uma ponte baseada em dados observados:
+
+```text
+T1 legado
+        ↓
+IMEI
+354173560222769
+        ↓
+identidade moderna
+        ↓
+device_serial
+202527000021P
+```
+
+---
+
+# 220. Descartar IMSI e ICCID como chaves exclusivas de resolução
+
+## O que?
+
+A inspeção das identidades mostrou que dispositivos diferentes podiam compartilhar valores observados de:
+
+```text
+IMSI
+ICCID
+```
+
+Por exemplo, identidades distintas apareceram com os mesmos valores desses campos.
+
+## Para que?
+
+Uma resolução histórica não pode utilizar uma chave que produza associação ambígua.
+
+Portanto, a regra não deve ser:
+
+```text
+IMSI
+→ device_serial
+```
+
+nem:
+
+```text
+ICCID
+→ device_serial
+```
+
+como associação única.
+
+## Decisão
+
+A evidência disponível favorece:
+
+```text
+IMEI
+→ device_serial
+```
+
+desde que a relação seja:
+
+```text
+inequívoca
+```
+
+---
+
+# 221. Quantificar a recuperação potencial das rejeições por serial
+
+## O que?
+
+Foi calculado quantos registros:
+
+```text
+MISSING_DEVICE_SERIAL
+```
+
+pertenciam a arquivos legados que possuíam exatamente um IMEI T1 válido.
+
+Resultado:
+
+```text
+FILES_RESOLVIVEIS:
+23
+
+REJEICOES_RESOLVIVEIS:
+55011
+```
+
+Total atual:
+
+```text
+TOTAL_MISSING_DEVICE_SERIAL:
+55217
+```
+
+Cobertura:
+
+```text
+99.63%
+```
+
+Restariam aproximadamente:
+
+```text
+206
+```
+
+registros sem resolução por essa estratégia.
+
+## Para que?
+
+Esse cálculo foi realizado antes de qualquer alteração no código.
+
+Assim, a decisão de mudar a Silver não se baseia apenas em hipótese.
+
+Ela possui impacto mensurável:
+
+```text
+55011
+```
+
+registros potencialmente válidos hoje classificados como rejeitados.
+
+---
+
+# 222. Concluir que a regra atual de serial é correta, mas incompleta para dados históricos
+
+## O que?
+
+A investigação mostrou que a regra atual:
+
+```text
+serial ausente
+        ↓
+MISSING_DEVICE_SERIAL
+```
+
+é adequada para registros que realmente não conseguem ser associados a um dispositivo.
+
+Porém, ela não considera o contexto histórico do:
+
+```text
+V14.06.111
+```
+
+## Problema
+
+Aplicar a regra literalmente produz:
+
+```text
+mensagem válida de tracker
++
+timestamp válido
++
+tipo válido
++
+dados válidos
++
+serial ausente por característica histórica
+        ↓
+rejected
+```
+
+mesmo quando existe uma forma determinística de recuperar a identidade.
+
+## Conclusão
+
+A regra não deve ser removida.
+
+Ela deve ser precedida por uma etapa de:
+
+```text
+resolução de identidade
+```
+
+---
+
+# 223. Rejeitar a solução de simplesmente aceitar mensagens sem serial
+
+## O que?
+
+Foi considerada e descartada a ideia de tratar:
+
+```text
+V14.06.111
+```
+
+como:
+
+```text
+serial opcional
+```
+
+## Por quê?
+
+Aceitar uma telemetria sem saber de qual dispositivo ela pertence criaria registros como:
+
+```text
+timestamp = válido
+latitude = válida
+longitude = válida
+device_serial = NULL
+```
+
+Isso quebraria os produtos Gold dependentes da entidade.
+
+Exemplos:
+
+```text
+dim_device
+device_last_position
+device_route_points
+device_daily_summary
+```
+
+A plataforma deixaria de conseguir responder corretamente:
+
+> de qual dispositivo é este evento?
+
+## Decisão
+
+Uma mensagem histórica somente poderá ser promovida da rejeição quando sua identidade puder ser resolvida de forma inequívoca.
+
+---
+
+# 224. Definir três métodos conceituais de resolução de identidade
+
+## O que?
+
+A resolução futura foi dividida conceitualmente em três situações.
+
+### DIRECT
+
+Quando o registro já possui serial:
+
+```text
+S/N ou IMEI
+→ 202527000021P
+```
+
+a resolução é direta.
+
+```text
+device_serial_raw
+= 202527000021P
+
+device_serial
+= 202527000021P
+
+resolution
+= DIRECT
+```
+
+### LEGACY
+
+Quando o protocolo legado não possui serial direto:
+
+```text
+V14.06.111
++
+source_file
++
+T1 com IMEI válido
+        ↓
+IMEI → serial conhecido
+```
+
+o dispositivo poderá ser resolvido historicamente.
+
+Exemplo:
+
+```text
+354173560222769
+        ↓
+202527000021P
+```
+
+### UNRESOLVED
+
+Quando nenhuma associação inequívoca puder ser obtida:
+
+```text
+device_serial = NULL
+```
+
+e o registro continuará em:
+
+```text
+rejected_logs
+```
+
+---
+
+# 225. Preservar `device_serial_raw` separado da identidade resolvida
+
+## O que?
+
+Foi definida uma regra importante para a futura implementação.
+
+O dado recebido da origem não deve ser sobrescrito.
+
+Portanto:
+
+```text
+device_serial_raw
+```
+
+deve continuar representando exatamente:
+
+```text
+o que veio no arquivo
+```
+
+mesmo quando for possível descobrir uma identidade posterior.
+
+## Exemplo legado
+
+```text
+device_serial_raw
+= NULL
+
+device_serial
+= 202527000021P
+```
+
+## Para que?
+
+Preservar simultaneamente:
+
+```text
+fidelidade ao dado bruto
++
+identidade operacional
+```
+
+Isso permite responder posteriormente:
+
+> o serial estava realmente presente no pacote?
+
+sem confundir essa pergunta com:
+
+> a plataforma conseguiu resolver o dispositivo?
+
+---
+
+# 226. Planejar um campo que registre o método de resolução
+
+## O que?
+
+A evolução futura deve tornar explícita a origem do:
+
+```text
+device_serial
+```
+
+Conceitualmente, pode existir algo como:
+
+```text
+device_resolution_method
+```
+
+com valores equivalentes a:
+
+```text
+DIRECT
+LEGACY_IMEI
+LEGACY_FILE_CONTEXT
+UNRESOLVED
+```
+
+## Para que?
+
+Dois registros podem terminar com:
+
+```text
+device_serial = 202527000021P
+```
+
+por caminhos diferentes.
+
+Um deles pode ter recebido o serial diretamente.
+
+Outro pode ter sido reconstruído através de identidade histórica.
+
+A Silver deve permitir distinguir os casos.
+
+Isso melhora:
+
+* auditabilidade;
+* qualidade de dados;
+* debug;
+* lineage semântico.
+
+---
+
+# 227. Definir que a resolução histórica deve ser conservadora
+
+## O que?
+
+Foi estabelecido que a plataforma não atribuirá automaticamente todas as linhas de um arquivo ao mesmo dispositivo apenas porque existe um T1 naquele arquivo.
+
+A resolução deverá exigir condições explícitas.
+
+## Condições
+
+O registro precisa continuar sendo uma mensagem de protocolo válida.
+
+Exemplo:
+
+```regex
+^T[0-9]+$
+```
+
+Também deve possuir os demais requisitos necessários, como timestamp utilizável.
+
+O arquivo/contexto precisa fornecer identidade inequívoca.
+
+## Para que?
+
+Arquivos históricos podem conter, no mesmo período:
+
+```text
+tracker válido
++
+HTTP
++
+scanner
++
+MQTT
++
+RTSP
++
+payload binário
+```
+
+Portanto:
+
+```text
+arquivo associado a um tracker
+```
+
+não implica:
+
+```text
+qualquer payload do arquivo
+é telemetria do tracker
+```
+
+---
+
+# 228. Manter tráfego externo em `rejected_logs`
+
+## O que?
+
+A futura resolução de identidade não deve alterar o tratamento dos registros identificados como tráfego externo.
+
+Continuam inválidos para os produtos operacionais:
+
+```text
+GET / HTTP
+MQTT
+PING
+RTSP
+payload binário
+strings aleatórias
+```
+
+## Para que?
+
+A resolução histórica existe para recuperar:
+
+```text
+mensagens reais de tracker
+```
+
+e não para reduzir artificialmente o contador de rejeições.
+
+O critério continua sendo qualidade e semântica correta.
+
+---
+
+# 229. Separar o problema do arquivo legado sem header da resolução de identidade
+
+## O que?
+
+A investigação revelou dois problemas históricos independentes.
+
+### Problema A
+
+```text
+logs_rastreador_2026-02-24.csv
+```
+
+não possui o contrato tabular atual.
+
+Solução futura:
+
+```text
+parser/adaptador de formato
+```
+
+### Problema B
+
+Arquivos tabulares válidos com:
+
+```text
+V14.06.111
+```
+
+possuem mensagens de tracker sem serial explícito.
+
+Solução:
+
+```text
+resolução de identidade
+```
+
+## Para que?
+
+Evitar implementar uma solução única para problemas de naturezas diferentes.
+
+A resolução de identidade não deve transformar a Silver em parser de arquivos malformados.
+
+Da mesma forma, um parser legado não resolve sozinho a ausência histórica de serial.
+
+---
+
+# 230. Definir `identity_resolution.py` como próxima evolução da Silver
+
+## O que?
+
+A próxima implementação planejada passa a ser:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        └── identity_resolution.py
+```
+
+## Responsabilidade
+
+O módulo deverá encapsular a descoberta de associações confiáveis entre:
+
+```text
+IMEI
+```
+
+e:
+
+```text
+device_serial
+```
+
+e o contexto legado necessário para aplicar essa associação.
+
+## Para que?
+
+Evitar inserir dentro de:
+
+```text
+classification.py
+```
+
+uma quantidade crescente de lógica histórica e de relacionamento entre identidades.
+
+A separação planejada é:
+
+```text
+normalization.py
+→ normaliza campos
+
+identity_resolution.py
+→ resolve identidade
+
+classification.py
+→ decide destino
+
+transformation.py
+→ tipa e projeta produtos
+```
+
+---
+
+# 231. Planejar construção de mapa direto IMEI → `device_serial`
+
+## O que?
+
+A primeira responsabilidade prevista para o resolver é descobrir relações modernas inequívocas.
+
+Conceitualmente:
+
+```text
+T1 com serial
++
+IMEI válido
+        ↓
+IMEI → device_serial
+```
+
+Exemplo observado:
+
+```text
+354173560222769
+→ 202527000021P
+```
+
+Outro exemplo:
+
+```text
+354173560218841
+→ 202527000022
+```
+
+## Regra de segurança
+
+Se um mesmo IMEI estiver associado a múltiplos seriais:
+
+```text
+IMEI X
+├── serial A
+└── serial B
+```
+
+a relação não deve ser utilizada automaticamente.
+
+Somente associações:
+
+```text
+1 IMEI
+→
+1 serial inequívoco
+```
+
+podem participar da resolução.
+
+---
+
+# 232. Planejar descoberta de contexto legado por `source_file`
+
+## O que?
+
+O segundo mapa necessário deverá identificar:
+
+```text
+source_file
+→ legacy_imei
+```
+
+a partir de mensagens:
+
+```text
+T1
++
+V14.06.111
++
+IMEI válido
+```
+
+## Regra
+
+Um arquivo somente será resolvível quando houver exatamente:
+
+```text
+1 IMEI válido distinto
+```
+
+no contexto considerado.
+
+Se houver:
+
+```text
+2 ou mais IMEIs válidos
+```
+
+o arquivo não poderá ser utilizado automaticamente como contexto único.
+
+## Para que?
+
+Evitar associar telemetria ao dispositivo errado quando um arquivo eventualmente contiver múltiplos trackers.
+
+---
+
+# 233. Planejar cruzamento entre contexto legado e identidade moderna
+
+## O que?
+
+Os dois mapas planejados serão combinados:
+
+```text
+source_file
+→ legacy_imei
+```
+
+e:
+
+```text
+legacy_imei
+→ device_serial
+```
+
+produzindo:
+
+```text
+source_file
+→ device_serial
+```
+
+somente quando toda a cadeia for inequívoca.
+
+Exemplo real observado:
+
+```text
+logs_rastreador_2026-03-18.csv
+        ↓
+354173560222769
+        ↓
+202527000021P
+```
+
+## Para que?
+
+Essa associação permite recuperar mensagens como:
+
+```text
+T14
+T3
+T27
+T28
+...
+```
+
+que não carregam serial no formato histórico, mas pertencem a um contexto de identidade comprovável.
+
+---
+
+# 234. Definir testes obrigatórios antes de integrar a resolução à classificação
+
+## O que?
+
+Antes de modificar:
+
+```text
+classification.py
+```
+
+o novo resolver deverá ser testado isoladamente.
+
+Os cenários mínimos planejados são:
+
+```text
+IMEI único + serial único
+→ resolve
+
+mesmo IMEI associado a dois seriais
+→ não resolve
+
+arquivo legado com dois IMEIs válidos
+→ não resolve
+
+arquivo legado sem T1 válido
+→ não resolve
+
+IMEI legado sem correspondência moderna
+→ não resolve
+```
+
+## Para que?
+
+A mudança potencialmente reclassificará dezenas de milhares de registros.
+
+Por isso, a lógica de identidade deve estar protegida antes de alterar o fluxo Silver completo.
+
+---
+
+# 235. Definir critério quantitativo para validar a futura mudança
+
+## O que?
+
+O estado atual fornece um baseline objetivo.
+
+Antes da resolução:
+
+```text
+MISSING_DEVICE_SERIAL
+= 55217
+```
+
+O diagnóstico identificou:
+
+```text
+55011
+```
+
+registros potencialmente recuperáveis.
+
+Portanto, após uma implementação correta, é esperado que a quantidade de rejeições desse tipo caia drasticamente.
+
+O limite teórico observado nesta investigação deixa aproximadamente:
+
+```text
+206
+```
+
+registros não cobertos pela associação identificada.
+
+## Para que?
+
+A validação futura não dependerá apenas de:
+
+```text
+testes passaram
+```
+
+Também poderá comparar:
+
+```text
+antes
+vs.
+depois
+```
+
+sobre o conjunto real.
+
+---
+
+# 236. Planejar rebuild após introdução da resolução histórica
+
+## O que?
+
+A resolução de identidade altera uma regra semântica da Silver.
+
+Registros atualmente armazenados em:
+
+```text
+rejected_logs
+```
+
+poderão passar para:
+
+```text
+telemetry_events
+```
+
+ou:
+
+```text
+device_identity_events
+```
+
+## Consequência
+
+Depois da implementação, será necessário reprocessar o histórico afetado.
+
+Conceitualmente:
+
+```text
+Bronze preservada
+        ↓
+Silver rebuild/reprocessamento
+        ↓
+novas classificações
+        ↓
+Gold rebuild/reprocessamento
+```
+
+## Para que?
+
+Apenas adicionar a nova regra não altera automaticamente registros já persistidos em partições antigas.
+
+O histórico precisa ser recalculado de acordo com a nova semântica.
+
+---
+
+# 237. Não alterar a Bronze durante a resolução histórica
+
+## O que?
+
+A decisão atual é manter:
+
+```text
+01_bronze/tracker_logs
+```
+
+como registro fiel da ingestão realizada.
+
+Nenhum serial resolvido será escrito retroativamente na Bronze.
+
+## Para que?
+
+A Bronze responde:
+
+> o que recebemos?
+
+A Silver responde:
+
+> como interpretamos?
+
+Se a Bronze fosse alterada para inserir identidades inferidas, essas duas responsabilidades seriam misturadas.
+
+O fluxo correto permanece:
+
+```text
+Raw
+ ↓
+Bronze
+fidelidade
+ ↓
+Silver
+interpretação
+ ↓
+Gold
+produto
+```
+
+---
+
+# 238. Estado atual após validação operacional e diagnóstico histórico
+
+## O que?
+
+Depois da implementação e dos testes realizados desde o passo 185, o estado passa a ser:
+
+```text
+Bronze
+████████████████████  funcional
+
+Silver
+████████████████████  funcional
+        │
+        └── evolução de identity resolution planejada
+
+Gold
+████████████████████  funcional
+
+Pipeline
+████████████████████  funcional
+
+CLI
+████████████████████  funcional
+
+Query Layer
+░░░░░░░░░░░░░░░░░░░░  ainda não iniciada
+
+REST API
+░░░░░░░░░░░░░░░░░░░░  ainda não iniciada
+
+MCP
+░░░░░░░░░░░░░░░░░░░░  ainda não iniciada
+```
+
+Os modos do pipeline foram validados operacionalmente:
+
+```text
+FULL         ✅
+NOOP         ✅
+INCREMENTAL  ✅
+```
+
+Também foram encontrados e separados três tipos de entrada problemática:
+
+1. **CSV legado sem header**
+   → `quarantine` / futuro parser;
+
+2. **tráfego externo ao protocolo**
+   → `rejected_logs`;
+
+3. **tracker `V14.06.111` sem serial explícito**
+   → candidato a identity resolution.
+
+---
+
+# 239. Próximo passo exato de desenvolvimento
+
+O próximo passo não deve ser ainda:
+
+```text
+Query Layer
+```
+
+Antes disso existe uma correção semântica importante descoberta com dados históricos reais.
+
+O próximo componente a ser implementado é:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        └── identity_resolution.py
+```
+
+A ordem recomendada é:
+
+```text
+1. implementar resolver isolado
+        ↓
+2. criar testes unitários
+        ↓
+3. validar relações IMEI → serial
+        ↓
+4. integrar resolução à Silver
+        ↓
+5. ajustar contratos se necessário
+        ↓
+6. executar rebuild Silver
+        ↓
+7. medir rejeições antes/depois
+        ↓
+8. reconstruir/atualizar Gold
+        ↓
+9. validar novamente FULL / NOOP / INCREMENTAL
+        ↓
+10. somente então iniciar Query Layer
+```
+
+O princípio da mudança é:
+
+```text
+não aceitar dados ruins
+```
+
+e também não:
+
+```text
+rejeitar dados históricos válidos
+por falta de contexto
+```
+
+A Silver passará a utilizar contexto de identidade somente quando a associação for comprovadamente inequívoca.
+
+Esse é o ponto exato para retomada do desenvolvimento.
 
