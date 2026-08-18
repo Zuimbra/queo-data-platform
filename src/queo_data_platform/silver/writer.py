@@ -47,7 +47,7 @@ def dataframe_to_arrow(
     for field in schema:
         column = aligned[field.name]
 
-        if column.isna().all():
+        if column.isna().to_numpy().all():
             array = pa.nulls(
                 len(column),
                 type=field.type,

@@ -11,6 +11,9 @@ dependencies = [
     "pyarrow>=25.0.1",
 ]
 
+[project.scripts]
+queo-data-platform = "queo_data_platform.cli:main"
+
 [dependency-groups]
 dev = [
     "pyright>=1.1.411",

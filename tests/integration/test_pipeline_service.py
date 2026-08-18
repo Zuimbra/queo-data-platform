@@ -3,9 +3,7 @@ from pathlib import Path
 import pandas as pd
 from deltalake import DeltaTable
 
-from queo_data_platform.config.settings import (
-    Settings,
-)
+from queo_data_platform.config.settings import Settings
 from queo_data_platform.contracts.gold import (
     DATA_QUALITY_SUMMARY_TABLE_NAME,
     DEVICE_DAILY_SUMMARY_TABLE_NAME,
@@ -14,6 +12,7 @@ from queo_data_platform.contracts.gold import (
     DIM_DEVICE_TABLE_NAME,
 )
 from queo_data_platform.contracts.tracker import (
+    BRONZE_TABLE_NAME,
     RAW_TRACKER_REQUIRED_COLUMNS,
 )
 from queo_data_platform.pipeline.service import (
@@ -281,3 +280,24 @@ def test_pipeline_propagates_new_batch_incrementally(
         "2026-08-17",
         "2026-08-18",
     }
+
+
+def test_pipeline_handles_empty_initial_environment(
+    tmp_path: Path,
+) -> None:
+    settings = build_test_settings(tmp_path)
+
+    result = run_pipeline(settings)
+
+    assert result.bronze.discovered_file_count == 0
+
+    assert result.bronze.batch_ids == ()
+
+    assert result.silver.mode == "NOOP"
+
+    assert result.gold.mode == "NOOP"
+
+    assert not result.has_new_data
+    assert not result.has_changes
+
+    assert not DeltaTable.is_deltatable(str(settings.bronze_dir / BRONZE_TABLE_NAME))
