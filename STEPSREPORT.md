@@ -9761,3 +9761,2985 @@ integração
 ```
 
 Esse é o ponto exato para retomada do desenvolvimento.
+
+Conferi o estado atual do `main`. O `STEPSREPORT.md` termina no **Passo 133**, enquanto a Gold já avançou até schemas explícitos, writer Delta, escopo incremental, service completo e testes de integração de fechamento. 
+
+**Não incluí o pipeline como concluído**, porque no repositório publicado `src/queo_data_platform/pipeline/` ainda contém apenas `__init__.py`. Além disso, a Silver publicada ainda interpreta `batch_ids=()` como `FULL`, ponto que precisa ser corrigido antes da orquestração ponta a ponta. ([GitHub][1])
+
+Copie e cole **a partir daqui**, depois do Passo 133:
+
+
+---
+
+# 134. Definir schemas PyArrow explícitos para os produtos Gold
+
+O próximo passo após a implementação dos cinco builders foi transformar:
+
+```text
+contracts/gold.py
+```
+
+em um contrato físico completo da camada Gold.
+
+Até então, o arquivo já definia:
+
+```text
+nomes das tabelas
+chaves
+colunas de partição
+```
+
+mas ainda não definia formalmente os tipos persistidos.
+
+Foram adicionados schemas PyArrow para os cinco produtos:
+
+```python
+DIM_DEVICE_SCHEMA
+DEVICE_LAST_POSITION_SCHEMA
+DEVICE_ROUTE_POINTS_SCHEMA
+DEVICE_DAILY_SUMMARY_SCHEMA
+DATA_QUALITY_SUMMARY_SCHEMA
+```
+
+## O que?
+
+Cada produto Gold passou a possuir uma definição explícita de:
+
+```text
+nome da coluna
+tipo físico
+ordem das colunas
+```
+
+Por exemplo, `dim_device` passou a possuir um schema semelhante a:
+
+```text
+device_serial                  string
+current_imei                   string
+current_imsi                   string
+current_iccid                  string
+current_identity_auxiliary     string
+current_protocol_version       string
+
+first_seen_at                  timestamp[us]
+last_seen_at                   timestamp[us]
+
+first_identity_at              timestamp[us]
+last_identity_at               timestamp[us]
+
+first_telemetry_at             timestamp[us]
+last_telemetry_at              timestamp[us]
+
+identity_event_count           int64
+telemetry_event_count          int64
+
+has_identity_event             bool
+has_telemetry_event            bool
+```
+
+## Para que?
+
+Evitar que o schema persistido dependa da inferência de tipos realizada em uma execução específica.
+
+O problema da inferência automática já havia aparecido na Silver.
+
+Por exemplo:
+
+```text
+execução A
+coluna possui valores
+        ↓
+tipo inferido corretamente
+
+execução B
+coluna completamente NULL
+        ↓
+tipo inferido pode mudar
+```
+
+Com o contrato explícito:
+
+```text
+builder
+   ↓
+PyArrow Table
+   ↓
+schema oficial Gold
+   ↓
+Delta Table
+```
+
+o contrato passa a ser a fonte de verdade.
+
+---
+
+# 135. Definir os tipos físicos compartilhados da Gold
+
+Foi criada a constante:
+
+```python
+GOLD_TIMESTAMP = pa.timestamp("us")
+```
+
+## O que?
+
+Essa constante representa o tipo utilizado pelos timestamps de negócio da Gold.
+
+Ela é reutilizada em campos como:
+
+```text
+first_seen_at
+last_seen_at
+
+last_position_at
+received_at
+
+event_timestamp
+
+first_event_at
+last_event_at
+
+first_valid_position_at
+last_valid_position_at
+```
+
+## Para que?
+
+Evitar repetir:
+
+```python
+pa.timestamp("us")
+```
+
+em vários schemas.
+
+Além disso, garante que todos os produtos utilizem a mesma resolução temporal.
+
+A estrutura fica:
+
+```text
+contracts/gold.py
+        │
+        └── GOLD_TIMESTAMP
+                │
+                ├── dim_device
+                ├── last_position
+                ├── route_points
+                └── daily_summary
+```
+
+---
+
+# 136. Manter datas de partição como texto
+
+As colunas:
+
+```text
+event_date
+metric_date
+```
+
+foram definidas como:
+
+```python
+pa.string()
+```
+
+e não como:
+
+```python
+pa.date32()
+```
+
+## O que?
+
+As tabelas particionadas da Gold utilizam:
+
+```text
+device_route_points
+→ event_date
+
+device_daily_summary
+→ event_date
+
+data_quality_summary
+→ metric_date
+```
+
+## Para que?
+
+Além das datas normais:
+
+```text
+2026-08-17
+2026-08-18
+```
+
+o fluxo de qualidade precisa suportar:
+
+```text
+unknown
+```
+
+para registros rejeitados sem timestamp válido.
+
+Portanto:
+
+```text
+metric_date
+```
+
+não pode assumir que todos os valores são datas reais.
+
+A decisão foi manter as partições como strings.
+
+---
+
+# 137. Classificar formalmente as tabelas Gold
+
+Foram adicionadas estruturas que classificam os produtos por estratégia de persistência.
+
+## Tabelas por entidade
+
+```python
+GOLD_ENTITY_TABLES = (
+    DIM_DEVICE_TABLE_NAME,
+    DEVICE_LAST_POSITION_TABLE_NAME,
+)
+```
+
+Isso representa:
+
+```text
+dim_device
+device_last_position
+```
+
+Ambas possuem:
+
+```text
+device_serial
+```
+
+como chave lógica.
+
+---
+
+## Tabelas particionadas
+
+Foi criado:
+
+```python
+GOLD_PARTITIONED_TABLES = {
+    DEVICE_ROUTE_POINTS_TABLE_NAME: GOLD_EVENT_PARTITION_COLUMN,
+    DEVICE_DAILY_SUMMARY_TABLE_NAME: GOLD_EVENT_PARTITION_COLUMN,
+    DATA_QUALITY_SUMMARY_TABLE_NAME: GOLD_QUALITY_PARTITION_COLUMN,
+}
+```
+
+Representando:
+
+```text
+device_route_points
+→ event_date
+
+device_daily_summary
+→ event_date
+
+data_quality_summary
+→ metric_date
+```
+
+## Para que?
+
+Permitir que a persistência trate corretamente dois tipos diferentes de produto:
+
+```text
+produto por entidade
+        ↓
+MERGE
+
+produto por partição
+        ↓
+replace seletivo
+```
+
+---
+
+# 138. Criar o catálogo de schemas Gold
+
+Também foi criado:
+
+```python
+GOLD_TABLE_SCHEMAS
+```
+
+com o mapeamento:
+
+```text
+dim_device
+→ DIM_DEVICE_SCHEMA
+
+device_last_position
+→ DEVICE_LAST_POSITION_SCHEMA
+
+device_route_points
+→ DEVICE_ROUTE_POINTS_SCHEMA
+
+device_daily_summary
+→ DEVICE_DAILY_SUMMARY_SCHEMA
+
+data_quality_summary
+→ DATA_QUALITY_SUMMARY_SCHEMA
+```
+
+## Para que?
+
+Centralizar a relação:
+
+```text
+nome lógico da tabela
+        ↓
+schema físico oficial
+```
+
+Isso facilita persistência, validação e futuras camadas de leitura.
+
+---
+
+# 139. Criar o writer da camada Gold
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── gold/
+        └── writer.py
+```
+
+## O que?
+
+Esse módulo concentra a persistência Delta da Gold.
+
+A separação ficou:
+
+```text
+builders
+→ transformação
+
+writer.py
+→ persistência
+```
+
+Ele implementa duas estratégias principais:
+
+```text
+entity tables
+→ MERGE
+
+partitioned tables
+→ selective overwrite
+```
+
+## Para que?
+
+Evitar que funções como:
+
+```text
+build_dim_device()
+build_device_route_points()
+```
+
+também sejam responsáveis por:
+
+```text
+abrir Delta Tables
+executar MERGE
+executar DELETE
+executar overwrite
+```
+
+Assim:
+
+```text
+Gold builder
+     ↓
+PyArrow Table
+     ↓
+Gold writer
+     ↓
+Delta Lake
+```
+
+---
+
+# 140. Alinhar produtos Gold ao schema oficial
+
+Foi criada:
+
+```python
+align_gold_table(...)
+```
+
+## O que?
+
+Antes da persistência, o writer verifica se o produto contém todas as colunas definidas no schema.
+
+A lógica começa com:
+
+```text
+schema.names
+     ↓
+comparar com table.column_names
+     ↓
+coluna ausente?
+     ↓
+ValueError
+```
+
+Depois:
+
+```python
+ordered = table.select(schema.names)
+```
+
+garante a ordem correta.
+
+Por fim:
+
+```python
+ordered.cast(
+    schema,
+    safe=True,
+)
+```
+
+converte os tipos para o contrato físico.
+
+## Para que?
+
+Mesmo que o DuckDB retorne:
+
+```text
+colunas em ordem diferente
+tipos compatíveis mas diferentes
+```
+
+o dado persistido deve seguir exatamente:
+
+```text
+contracts/gold.py
+```
+
+---
+
+# 141. Preservar schema em produtos Gold vazios
+
+`align_gold_table()` também trata:
+
+```text
+table.num_rows == 0
+```
+
+de forma especial.
+
+Nesse caso:
+
+```python
+pa.Table.from_batches(
+    [],
+    schema=schema,
+)
+```
+
+é retornado.
+
+## O que?
+
+Um produto vazio continua carregando o schema completo.
+
+Exemplo:
+
+```text
+0 registros
+```
+
+mas ainda:
+
+```text
+device_serial      string
+latitude           float64
+event_timestamp    timestamp[us]
+...
+```
+
+## Para que?
+
+Evitar que:
+
+```text
+resultado vazio
+    ↓
+inferência de schema
+    ↓
+null / int32 / tipos inconsistentes
+```
+
+quebre rebuilds incrementais ou criação de Delta Tables.
+
+---
+
+# 142. Validar a chave das tabelas por entidade
+
+Foi criada:
+
+```python
+validate_entity_key(...)
+```
+
+## O que?
+
+Antes de um MERGE, o writer verifica:
+
+```text
+a coluna existe?
+        ↓
+não → erro
+
+possui NULL?
+        ↓
+sim → erro
+
+possui chave duplicada?
+        ↓
+sim → erro
+```
+
+A chave utilizada atualmente é:
+
+```text
+device_serial
+```
+
+## Para que?
+
+Um MERGE precisa de correspondência determinística.
+
+Este caso é inválido:
+
+```text
+source
+device_serial = 1001
+device_serial = 1001
+```
+
+porque o writer não deveria decidir qual linha representa o estado final da entidade.
+
+Essa responsabilidade pertence ao builder.
+
+---
+
+# 143. Implementar persistência FULL das tabelas por entidade
+
+Foi criada:
+
+```python
+write_gold_entity_table(...)
+```
+
+No modo:
+
+```text
+full_rebuild = True
+```
+
+é executado:
+
+```python
+write_deltalake(
+    table_path,
+    aligned,
+    mode="overwrite",
+    schema_mode="overwrite",
+)
+```
+
+## O que?
+
+Uma reconstrução FULL substitui completamente o estado anterior da tabela.
+
+Fluxo:
+
+```text
+Silver completa
+     ↓
+builder completo
+     ↓
+Gold completa
+     ↓
+overwrite
+```
+
+## Para que?
+
+Casos como:
+
+```text
+primeira execução
+Gold inexistente
+migração de schema
+Gold incompleta
+rebuild solicitado
+```
+
+precisam reconstruir o produto inteiro.
+
+---
+
+# 144. Implementar MERGE incremental das tabelas por entidade
+
+Quando:
+
+```text
+full_rebuild = False
+```
+
+`write_gold_entity_table()` executa um MERGE Delta.
+
+A condição utilizada é:
+
+```text
+target.device_serial
+=
+source.device_serial
+```
+
+O MERGE possui:
+
+```text
+MATCHED
+→ UPDATE ALL
+
+NOT MATCHED
+→ INSERT ALL
+```
+
+## O que?
+
+Exemplo:
+
+```text
+Gold atual
+
+1001 → estado antigo
+2002 → estado atual
+```
+
+Novo escopo:
+
+```text
+1001 → estado recalculado
+3003 → dispositivo novo
+```
+
+Resultado:
+
+```text
+1001 → atualizado
+2002 → preservado
+3003 → inserido
+```
+
+## Para que?
+
+Evitar sobrescrever:
+
+```text
+dim_device
+device_last_position
+```
+
+inteiras quando apenas poucos dispositivos mudaram.
+
+---
+
+# 145. Implementar persistência seletiva das tabelas particionadas
+
+Foi criada:
+
+```python
+write_gold_partitioned_table(...)
+```
+
+## FULL
+
+Quando:
+
+```text
+full_rebuild = True
+```
+
+é feito:
+
+```text
+overwrite completo
++
+partition_by
+```
+
+## INCREMENTAL
+
+Quando:
+
+```text
+full_rebuild = False
+```
+
+o writer percorre:
+
+```python
+affected_partitions
+```
+
+e reconstrói somente cada partição afetada.
+
+Exemplo:
+
+```text
+Gold
+├── 2026-08-17
+├── 2026-08-18
+└── 2026-08-19
+
+affected
+└── 2026-08-18
+```
+
+Resultado:
+
+```text
+17 → preservado
+18 → substituído
+19 → preservado
+```
+
+## Para que?
+
+Manter o mesmo princípio de late-arriving data utilizado na Silver:
+
+```text
+nova informação antiga
+        ↓
+descobrir data afetada
+        ↓
+recalcular estado completo da data
+        ↓
+substituir apenas a data
+```
+
+---
+
+# 146. Filtrar cada partição antes do overwrite
+
+Foi criada:
+
+```python
+filter_partition(...)
+```
+
+A função usa:
+
+```python
+pc.call_function("equal", [...])
+```
+
+para selecionar apenas:
+
+```text
+partition_column
+=
+partition_value
+```
+
+## O que?
+
+Se:
+
+```text
+table
+├── 17/08
+├── 18/08
+└── 19/08
+```
+
+e o loop está processando:
+
+```text
+18/08
+```
+
+o writer obtém apenas:
+
+```text
+partition_table
+└── 18/08
+```
+
+antes de executar o overwrite Delta.
+
+---
+
+# 147. Remover partições que ficaram vazias
+
+O incremental também trata o cenário:
+
+```text
+partição existia anteriormente
+        ↓
+rebuild atual produz 0 registros
+```
+
+Nesse caso:
+
+```python
+delta_table.delete(predicate)
+```
+
+é executado.
+
+## Para que?
+
+Sem esse comportamento:
+
+```text
+Gold antiga
+17/08 → 10 registros
+
+rebuild
+17/08 → 0 registros
+```
+
+deixaria os 10 registros antigos incorretamente persistidos.
+
+O comportamento correto é:
+
+```text
+rebuild = vazio
+        ↓
+remover partição anterior
+```
+
+---
+
+# 148. Adicionar testes unitários do writer Gold
+
+Foi criado:
+
+```text
+tests/unit/test_gold_writer.py
+```
+
+Os testes cobrem:
+
+```text
+schema preservado em resultado vazio
+FULL de tabela por entidade
+MERGE com UPDATE + INSERT
+rejeição de chaves duplicadas
+FULL particionado
+replace somente da data afetada
+remoção de partição que ficou vazia
+erro em incremental sem Delta Table existente
+```
+
+## Para que?
+
+Esses testes validam diretamente as propriedades críticas da persistência:
+
+```text
+schema
+idempotência
+escopo incremental
+integridade das entidades
+preservação de partições não afetadas
+```
+
+---
+
+# 149. Criar o modelo de escopo incremental da Gold
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── gold/
+        └── incremental.py
+```
+
+com:
+
+```python
+@dataclass(frozen=True)
+class GoldIncrementalScope:
+```
+
+O objeto possui:
+
+```text
+event_dates
+rejection_dates
+quality_dates
+affected_devices
+```
+
+## O que?
+
+Ele representa:
+
+> exatamente qual parte da Gold precisa ser recalculada.
+
+Exemplo:
+
+```text
+event_dates
+→ 2026-08-17
+
+rejection_dates
+→ 2026-08-17
+→ unknown
+
+quality_dates
+→ 2026-08-17
+→ unknown
+
+affected_devices
+→ 1001
+→ 2002
+```
+
+---
+
+# 150. Normalizar valores de partição Gold
+
+Foi criada:
+
+```python
+normalize_partition_values(...)
+```
+
+A função:
+
+```text
+remove valores vazios
+remove duplicatas
+remove espaços
+ordena valores
+```
+
+Exemplo:
+
+```text
+entrada:
+
+2026-08-18
+" 2026-08-17 "
+2026-08-18
+""
+```
+
+resultado:
+
+```text
+2026-08-17
+2026-08-18
+```
+
+## Para que?
+
+Garantir que o escopo incremental seja:
+
+```text
+limpo
+determinístico
+sem duplicidade
+```
+
+antes de chegar aos builders e writers.
+
+---
+
+# 151. Calcular datas afetadas da qualidade
+
+Foi criada:
+
+```python
+build_quality_dates(...)
+```
+
+A lógica é:
+
+```text
+quality_dates
+=
+event_dates
+UNION
+rejection_dates
+```
+
+## Por quê?
+
+`data_quality_summary` depende de:
+
+```text
+telemetry_events
+device_identity_events
+rejected_logs
+```
+
+Então tanto:
+
+```text
+novo evento aceito
+```
+
+quanto:
+
+```text
+nova rejeição
+```
+
+podem alterar uma métrica diária de qualidade.
+
+Exemplo:
+
+```text
+event_dates
+→ 17/08
+→ 18/08
+
+rejection_dates
+→ 18/08
+→ unknown
+```
+
+resultado:
+
+```text
+quality_dates
+→ 17/08
+→ 18/08
+→ unknown
+```
+
+---
+
+# 152. Descobrir dispositivos afetados
+
+Foi criada:
+
+```python
+discover_affected_devices(...)
+```
+
+## O que?
+
+A função recebe:
+
+```text
+event_dates
+```
+
+e consulta duas fontes:
+
+```text
+silver_telemetry
+silver_identity
+```
+
+Ela executa:
+
+```text
+telemetry devices
+        +
+identity devices
+        ↓
+UNION
+        ↓
+affected_devices
+```
+
+## Para que?
+
+Uma alteração de telemetria pode modificar:
+
+```text
+dim_device
+device_last_position
+```
+
+mas uma mensagem de identidade T1 também pode modificar:
+
+```text
+current_imei
+current_imsi
+current_iccid
+current_protocol_version
+first_seen_at
+last_seen_at
+identity_event_count
+```
+
+Por isso não basta olhar somente:
+
+```text
+telemetry_events
+```
+
+---
+
+# 153. Separar datas afetadas de dispositivos afetados
+
+A incrementalidade Gold passou a distinguir dois conceitos.
+
+## Produtos por data
+
+```text
+device_route_points
+device_daily_summary
+```
+
+recebem:
+
+```text
+event_dates
+```
+
+## Produto de qualidade
+
+```text
+data_quality_summary
+```
+
+recebe:
+
+```text
+quality_dates
+```
+
+## Produtos por entidade
+
+```text
+dim_device
+device_last_position
+```
+
+recebem:
+
+```text
+affected_devices
+```
+
+A estrutura fica:
+
+```text
+SilverLoadResult
+      │
+      ├── affected_event_dates
+      │          │
+      │          ├── route_points
+      │          ├── daily_summary
+      │          │
+      │          └── discover devices
+      │                    │
+      │                    ├── dim_device
+      │                    └── last_position
+      │
+      └── affected_rejection_dates
+                  │
+                  ▼
+       event_dates ∪ rejection_dates
+                  │
+                  ▼
+             quality_dates
+                  │
+                  ▼
+        data_quality_summary
+```
+
+---
+
+# 154. Adicionar testes do escopo incremental Gold
+
+Foi criado:
+
+```text
+tests/unit/test_gold_incremental.py
+```
+
+Os testes verificam:
+
+```text
+normalização de partições
+
+união de event_dates
++
+rejection_dates
+
+dispositivos vindos de telemetria
+
+dispositivos vindos de identidade
+
+isolamento entre datas
+
+rejeição unknown sem alteração de entidades
+
+construção completa de GoldIncrementalScope
+```
+
+Um caso especialmente importante é:
+
+```text
+affected_event_dates = ()
+
+affected_rejection_dates =
+("unknown",)
+```
+
+Nesse caso:
+
+```text
+affected_devices = ()
+
+quality_dates =
+("unknown",)
+```
+
+Ou seja:
+
+```text
+apenas qualidade precisa mudar
+```
+
+---
+
+# 155. Criar o service da camada Gold
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── gold/
+        └── service.py
+```
+
+## O que?
+
+O service passou a orquestrar:
+
+```text
+fontes Silver
+     ↓
+DuckDB
+     ↓
+Gold base views
+     ↓
+escopo
+     ↓
+builders
+     ↓
+writer
+     ↓
+GoldLoadResult
+```
+
+O objetivo é manter:
+
+```text
+builders
+→ transformação
+
+incremental.py
+→ descoberta de escopo
+
+writer.py
+→ persistência
+
+service.py
+→ orquestração
+```
+
+---
+
+# 156. Criar `GoldPaths`
+
+Foi criada:
+
+```python
+@dataclass(frozen=True)
+class GoldPaths:
+```
+
+Ela contém:
+
+```text
+telemetry
+identity
+rejected
+
+dim_device
+last_position
+route_points
+daily_summary
+quality_summary
+```
+
+## Para que?
+
+Centralizar todos os caminhos físicos usados pela execução Gold.
+
+Em vez de espalhar:
+
+```python
+gold_dir / "dim_device"
+gold_dir / "device_route_points"
+```
+
+pela implementação, os caminhos são resolvidos em:
+
+```python
+get_gold_paths(...)
+```
+
+---
+
+# 157. Criar `GoldProducts`
+
+Também foi criada:
+
+```python
+@dataclass(frozen=True)
+class GoldProducts:
+```
+
+contendo:
+
+```text
+dim_device
+last_position
+route_points
+daily_summary
+quality_summary
+```
+
+Cada atributo é:
+
+```text
+pa.Table
+```
+
+## O que?
+
+Esse objeto representa:
+
+```text
+resultado dos builders
+```
+
+antes da persistência.
+
+Fluxo:
+
+```text
+DuckDB
+  ↓
+builders
+  ↓
+GoldProducts
+  ↓
+writer
+```
+
+---
+
+# 158. Criar `GoldLoadResult`
+
+Foi criado:
+
+```python
+@dataclass(frozen=True)
+class GoldLoadResult:
+```
+
+com:
+
+```text
+mode
+
+affected_event_dates
+affected_rejection_dates
+affected_quality_dates
+affected_devices
+
+dim_device_rows_written
+last_position_rows_written
+route_points_rows_written
+daily_summary_rows_written
+quality_summary_rows_written
+```
+
+Também foi adicionada:
+
+```python
+@property
+def has_changes(...)
+```
+
+## Para que?
+
+A Gold deixa de retornar apenas:
+
+```text
+processamento concluído
+```
+
+e passa a informar exatamente:
+
+```text
+qual modo executou
+
+qual escopo foi afetado
+
+quais entidades mudaram
+
+quantas linhas foram persistidas
+```
+
+Isso prepara a integração futura com:
+
+```text
+pipeline
+logs
+observabilidade
+API administrativa
+```
+
+---
+
+# 159. Validar que todas as fontes Silver existem
+
+Foi criada:
+
+```python
+validate_silver_sources(...)
+```
+
+A Gold exige:
+
+```text
+telemetry_events
+device_identity_events
+rejected_logs
+```
+
+como Delta Tables válidas.
+
+Se alguma estiver ausente:
+
+```text
+Gold
+→ FileNotFoundError
+```
+
+## Para que?
+
+Evitar que a Gold construa um estado aparentemente válido a partir de uma Silver incompleta.
+
+A regra é:
+
+```text
+Silver completa
+→ Gold pode executar
+
+Silver incompleta
+→ erro
+```
+
+---
+
+# 160. Registrar Delta Tables Silver no DuckDB
+
+Foi criada:
+
+```python
+register_silver_sources(...)
+```
+
+A função abre:
+
+```text
+telemetry_events
+device_identity_events
+rejected_logs
+```
+
+com:
+
+```python
+DeltaTable(...)
+```
+
+e registra os datasets no DuckDB.
+
+As relações utilizadas são:
+
+```text
+silver_telemetry
+silver_identity
+silver_rejected
+```
+
+Fluxo:
+
+```text
+Delta Lake
+   ↓
+PyArrow Dataset
+   ↓
+DuckDB relation
+```
+
+## Para que?
+
+Os builders Gold continuam trabalhando com DuckDB sem conhecer detalhes da persistência física.
+
+---
+
+# 161. Descobrir o escopo completo de um rebuild Gold
+
+Foram criadas:
+
+```python
+discover_all_event_dates(...)
+discover_all_rejection_dates(...)
+build_full_gold_scope(...)
+```
+
+## O que?
+
+No modo FULL, o service não depende do escopo incremental recebido da Silver.
+
+Ele consulta diretamente o estado atual das tabelas.
+
+### Datas de eventos
+
+São obtidas de:
+
+```text
+telemetry
+UNION
+identity
+```
+
+### Datas de rejeição
+
+São obtidas de:
+
+```text
+rejected_logs
+```
+
+incluindo:
+
+```text
+unknown
+```
+
+Depois:
+
+```text
+event_dates
++
+rejection_dates
+        ↓
+build_gold_incremental_scope()
+        ↓
+scope completo
+```
+
+## Para que?
+
+Um rebuild FULL precisa representar:
+
+```text
+todo o estado Silver atual
+```
+
+e não apenas o último batch executado.
+
+---
+
+# 162. Implementar execução FULL dos cinco builders
+
+Foi criada:
+
+```python
+build_gold_products(...)
+```
+
+No modo:
+
+```text
+full_rebuild = True
+```
+
+são executados sem filtros:
+
+```python
+build_dim_device(connection)
+
+build_device_last_position(connection)
+
+build_device_route_points(connection)
+
+build_device_daily_summary(connection)
+
+build_data_quality_summary(connection)
+```
+
+## O que?
+
+Todos os produtos são recalculados a partir da Silver completa.
+
+Fluxo:
+
+```text
+Silver completa
+     ↓
+Gold base
+     ↓
+5 builders completos
+     ↓
+GoldProducts
+```
+
+---
+
+# 163. Executar apenas builders afetados no incremental
+
+O comportamento incremental foi refinado.
+
+Antes de executar cada builder, o service verifica o escopo.
+
+## Produtos por entidade
+
+```python
+if scope.affected_devices:
+```
+
+só então são executados:
+
+```text
+dim_device
+device_last_position
+```
+
+## Produtos por data
+
+```python
+if scope.event_dates:
+```
+
+só então são executados:
+
+```text
+device_route_points
+device_daily_summary
+```
+
+## Produto de qualidade
+
+```python
+if scope.quality_dates:
+```
+
+só então é executado:
+
+```text
+data_quality_summary
+```
+
+## Para que?
+
+Evitar processamento desnecessário.
+
+Exemplo:
+
+```text
+nova rejeição
+rejection_date = unknown
+```
+
+gera:
+
+```text
+affected_devices = ()
+event_dates = ()
+quality_dates = ("unknown",)
+```
+
+Então:
+
+```text
+dim_device              não executa
+last_position           não executa
+route_points            não executa
+daily_summary           não executa
+quality_summary         executa
+```
+
+---
+
+# 164. Criar produtos Gold vazios com schema explícito
+
+Para permitir que produtos não afetados atravessem o fluxo sem executar builders, foi criada:
+
+```python
+empty_gold_table(...)
+```
+
+A função retorna:
+
+```python
+pa.Table.from_batches(
+    [],
+    schema=schema,
+)
+```
+
+## O que?
+
+Um produto não afetado é representado por:
+
+```text
+0 linhas
++
+schema oficial
+```
+
+## Para que?
+
+Isso permite manter:
+
+```text
+GoldProducts
+```
+
+sempre completo, sem utilizar:
+
+```text
+None
+```
+
+e sem executar builders desnecessários.
+
+Exemplo:
+
+```text
+quality-only update
+
+GoldProducts
+├── dim_device          0 linhas
+├── last_position       0 linhas
+├── route_points        0 linhas
+├── daily_summary       0 linhas
+└── quality_summary     recalculado
+```
+
+---
+
+# 165. Centralizar a persistência em `write_gold_products`
+
+Foi criada:
+
+```python
+write_gold_products(...)
+```
+
+## O que?
+
+Ela recebe:
+
+```text
+GoldPaths
+GoldProducts
+GoldIncrementalScope
+full_rebuild
+```
+
+e direciona cada produto ao writer correto.
+
+### Entidades
+
+```text
+dim_device
+last_position
+        ↓
+write_gold_entity_table()
+```
+
+### Partições por evento
+
+```text
+route_points
+daily_summary
+        ↓
+write_gold_partitioned_table()
+        ↓
+event_date
+```
+
+### Qualidade
+
+```text
+quality_summary
+        ↓
+write_gold_partitioned_table()
+        ↓
+metric_date
+```
+
+---
+
+# 166. Implementar os modos FULL, INCREMENTAL e NOOP da Gold
+
+A função principal passou a ser:
+
+```python
+load_gold_data(...)
+```
+
+Ela decide entre três modos.
+
+## FULL
+
+Executado quando:
+
+```text
+Gold não existe
+```
+
+ou:
+
+```text
+Gold está incompleta
+```
+
+ou:
+
+```text
+silver_result não foi informado
+```
+
+ou:
+
+```text
+Silver executou FULL
+```
+
+---
+
+## INCREMENTAL
+
+Executado quando:
+
+```text
+Gold completa
++
+SilverLoadResult.mode = INCREMENTAL
+```
+
+Nesse caso:
+
+```text
+SilverLoadResult
+     ↓
+GoldIncrementalScope
+     ↓
+builders seletivos
+     ↓
+writers seletivos
+```
+
+---
+
+## NOOP
+
+Executado quando:
+
+```text
+Gold completa
++
+SilverLoadResult.mode = NOOP
+```
+
+ou quando o escopo incremental calculado fica vazio.
+
+Resultado:
+
+```text
+GoldLoadResult.mode
+=
+NOOP
+```
+
+com:
+
+```text
+rows_written = 0
+```
+
+---
+
+# 167. Criar `build_noop_result`
+
+Foi adicionada:
+
+```python
+build_noop_result(...)
+```
+
+## O que?
+
+A função cria de forma centralizada um:
+
+```text
+GoldLoadResult
+```
+
+sem alterações.
+
+Ela mantém:
+
+```text
+affected_event_dates
+affected_rejection_dates
+affected_quality_dates
+```
+
+normalizados, mas retorna:
+
+```text
+affected_devices = ()
+
+todos rows_written = 0
+```
+
+## Para que?
+
+Evitar repetir a construção do resultado NOOP em vários pontos do service.
+
+---
+
+# 168. Implementar recuperação automática de Gold incompleta
+
+Foi criada a regra:
+
+```text
+Silver NOOP
++
+Gold incompleta
+≠
+Gold NOOP
+```
+
+Neste caso:
+
+```text
+Gold
+→ FULL
+```
+
+## Exemplo
+
+Estado:
+
+```text
+Silver
+├── telemetry_events      existe
+├── identity_events       existe
+└── rejected_logs         existe
+
+Gold
+├── dim_device            existe
+├── last_position         existe
+├── route_points          AUSENTE
+├── daily_summary         existe
+└── quality_summary       existe
+```
+
+Mesmo que:
+
+```text
+SilverLoadResult.mode = NOOP
+```
+
+o service detecta:
+
+```text
+Gold incompleta
+```
+
+e executa:
+
+```text
+FULL rebuild
+```
+
+## Para que?
+
+Permitir autorrecuperação da camada Gold a partir da Silver persistida.
+
+---
+
+# 169. Criar interface Gold baseada em `Settings`
+
+Foi adicionada:
+
+```python
+load_gold(
+    settings,
+    silver_result=...,
+)
+```
+
+Ela delega para:
+
+```python
+load_gold_data(
+    silver_dir=settings.silver_dir,
+    gold_dir=settings.gold_dir,
+    silver_result=silver_result,
+)
+```
+
+## Para que?
+
+Manter duas formas de uso.
+
+### Interna e testes
+
+```python
+load_gold_data(
+    silver_dir=...,
+    gold_dir=...,
+)
+```
+
+### Aplicação
+
+```python
+load_gold(settings)
+```
+
+Isso mantém os caminhos centralizados em:
+
+```text
+config/settings.py
+```
+
+---
+
+# 170. Adicionar testes de integração do service Gold
+
+Foi expandido:
+
+```text
+tests/integration/test_gold_service.py
+```
+
+O arquivo cria Delta Tables Silver reais para testar a Gold de ponta a ponta.
+
+Os cenários cobertos incluem:
+
+```text
+FULL inicial
+
+NOOP quando Silver não mudou
+
+incremental por data afetada
+
+late-arriving data
+
+incremental somente da partição unknown
+
+recuperação de Gold incompleta
+
+erro quando fontes Silver estão ausentes
+
+execução usando Settings
+```
+
+---
+
+# 171. Validar late-arriving data na Gold
+
+Um dos testes adiciona posteriormente uma nova telemetria para uma data antiga.
+
+Exemplo:
+
+```text
+Gold existente
+
+17/08
+18/08
+```
+
+Depois chega:
+
+```text
+nova telemetria
+17/08 12:00
+```
+
+O resultado esperado é:
+
+```text
+17/08
+→ reconstruído
+
+18/08
+→ preservado
+```
+
+O teste verifica isso em:
+
+```text
+device_route_points
+device_daily_summary
+```
+
+## Para que?
+
+Confirmar que:
+
+```text
+incremental
+```
+
+não significa:
+
+```text
+processar somente as novas linhas
+```
+
+mas:
+
+```text
+descobrir escopo afetado
+        ↓
+reconstruir o estado correto desse escopo
+```
+
+---
+
+# 172. Validar atualização exclusiva de `unknown`
+
+Foi adicionado um teste específico para:
+
+```text
+rejected_logs
+rejection_date = unknown
+```
+
+Nesse cenário:
+
+```text
+affected_event_dates = ()
+
+affected_rejection_dates =
+("unknown",)
+
+affected_devices = ()
+
+quality_dates =
+("unknown",)
+```
+
+O comportamento validado é:
+
+```text
+dim_device_rows_written = 0
+
+last_position_rows_written = 0
+
+route_points_rows_written = 0
+
+daily_summary_rows_written = 0
+
+quality_summary_rows_written = 1
+```
+
+## Para que?
+
+Confirmar que uma alteração puramente de qualidade não provoca processamento operacional desnecessário.
+
+---
+
+# 173. Validar recuperação quando uma tabela Gold desaparece
+
+Foi adicionado um teste que:
+
+```text
+1. cria toda a Gold
+2. remove device_route_points
+3. informa Silver NOOP
+4. executa a Gold novamente
+```
+
+O resultado esperado é:
+
+```text
+mode = FULL
+```
+
+e todas as cinco tabelas devem existir novamente.
+
+## Para que?
+
+Validar a regra:
+
+```text
+NOOP da fonte
+≠
+camada destino saudável
+```
+
+---
+
+# 174. Validar ausência das fontes Silver
+
+Também foi adicionado um teste em que:
+
+```text
+02_silver/
+```
+
+existe, mas suas Delta Tables não.
+
+A chamada:
+
+```python
+load_gold_data(...)
+```
+
+deve lançar:
+
+```text
+FileNotFoundError
+```
+
+## Para que?
+
+Impedir que a Gold seja criada silenciosamente sem fontes válidas.
+
+---
+
+# 175. Validar execução Gold através de `Settings`
+
+Foi criado um teste que monta:
+
+```python
+Settings(...)
+```
+
+com diretórios temporários.
+
+Depois executa:
+
+```python
+load_gold(settings)
+```
+
+e confirma a criação de:
+
+```text
+dim_device
+device_last_position
+device_route_points
+device_daily_summary
+data_quality_summary
+```
+
+## Para que?
+
+Validar não apenas:
+
+```text
+load_gold_data()
+```
+
+mas também a interface pública que será utilizada pelo futuro pipeline.
+
+---
+
+# 176. Estado atual da camada Gold
+
+A camada Gold possui agora:
+
+```text
+src/
+└── queo_data_platform/
+    │
+    ├── contracts/
+    │   └── gold.py
+    │
+    └── gold/
+        ├── __init__.py
+        ├── base.py
+        ├── dim_device.py
+        ├── last_position.py
+        ├── route_points.py
+        ├── daily_summary.py
+        ├── quality_summary.py
+        ├── incremental.py
+        ├── writer.py
+        └── service.py
+```
+
+O fluxo completo é:
+
+```text
+Silver Delta Tables
+        │
+        ▼
+register_silver_sources
+        │
+        ▼
+DuckDB
+        │
+        ▼
+Gold base views
+        │
+        ├── telemetry_gold_base
+        └── identity_gold_base
+        │
+        ▼
+Gold scope
+        │
+        ├── event_dates
+        ├── rejection_dates
+        ├── quality_dates
+        └── affected_devices
+        │
+        ▼
+Gold builders
+        │
+        ├── dim_device
+        ├── device_last_position
+        ├── device_route_points
+        ├── device_daily_summary
+        └── data_quality_summary
+        │
+        ▼
+Gold schemas
+        │
+        ▼
+Gold writer
+        │
+        ├── entity MERGE
+        └── partition replace
+        │
+        ▼
+Delta Lake
+        │
+        ▼
+GoldLoadResult
+```
+
+---
+
+# 177. Situação atual das três camadas do Lakehouse
+
+O projeto chegou ao seguinte estado:
+
+```text
+                         QUEO DATA PLATFORM
+
+Raw
+ │
+ ▼
+Bronze                                      ✅
+ │
+ ├── múltiplos arquivos
+ ├── validação
+ ├── quarantine
+ ├── archive
+ ├── hash
+ ├── lineage
+ ├── tabela de controle
+ ├── MERGE insert-only
+ ├── idempotência
+ └── BronzeLoadResult
+ │
+ ▼
+Silver                                      ✅
+ │
+ ├── normalization
+ ├── classification
+ ├── transformation
+ ├── explicit schemas
+ ├── telemetry_events
+ ├── device_identity_events
+ ├── rejected_logs
+ ├── Delta writer
+ ├── affected partitions
+ ├── late-arriving
+ ├── FULL
+ ├── INCREMENTAL
+ ├── NOOP
+ └── SilverLoadResult
+ │
+ ▼
+Gold                                        ✅
+ │
+ ├── explicit schemas
+ ├── deduplicated base views
+ │
+ ├── dim_device
+ ├── device_last_position
+ ├── device_route_points
+ ├── device_daily_summary
+ ├── data_quality_summary
+ │
+ ├── incremental scope
+ ├── affected devices
+ ├── quality dates
+ │
+ ├── MERGE de entidades
+ ├── selective partition overwrite
+ ├── empty partition cleanup
+ │
+ ├── FULL
+ ├── INCREMENTAL
+ ├── NOOP
+ ├── recovery rebuild
+ └── GoldLoadResult
+ │
+ ▼
+Pipeline                                    ⏳
+ │
+ ▼
+Query Layer                                 ⏳
+ │
+ ├── REST API                               ⏳
+ └── MCP                                    ⏳
+```
+
+---
+
+# 178. Separação de responsabilidades atingida na Gold
+
+A implementação final não concentra tudo em um único arquivo.
+
+A responsabilidade ficou:
+
+```text
+contracts/gold.py
+→ estrutura física dos produtos
+
+gold/base.py
+→ relações deduplicadas compartilhadas
+
+gold/dim_device.py
+→ transformação da dimensão
+
+gold/last_position.py
+→ transformação da última posição
+
+gold/route_points.py
+→ transformação da rota
+
+gold/daily_summary.py
+→ agregação diária
+
+gold/quality_summary.py
+→ métricas de qualidade
+
+gold/incremental.py
+→ descoberta do escopo afetado
+
+gold/writer.py
+→ persistência Delta
+
+gold/service.py
+→ orquestração
+```
+
+## Para que?
+
+Evitar uma estrutura como:
+
+```text
+gold.py
+├── transformação
+├── SQL
+├── Delta
+├── incrementalidade
+├── paths
+├── orchestration
+└── regras de recovery
+```
+
+em um único módulo.
+
+A arquitetura atual permite testar cada responsabilidade isoladamente.
+
+---
+
+# 179. Contratos de resultado entre as camadas
+
+Neste ponto, cada camada possui um objeto que descreve sua execução.
+
+```text
+Bronze
+   ↓
+BronzeLoadResult
+
+Silver
+   ↓
+SilverLoadResult
+
+Gold
+   ↓
+GoldLoadResult
+```
+
+## Bronze
+
+Informa principalmente:
+
+```text
+arquivos descobertos
+arquivos processados
+linhas inseridas
+batch_ids
+```
+
+## Silver
+
+Informa:
+
+```text
+mode
+batch_ids
+affected_event_dates
+affected_rejection_dates
+rows_written
+```
+
+## Gold
+
+Informa:
+
+```text
+mode
+affected_event_dates
+affected_rejection_dates
+affected_quality_dates
+affected_devices
+rows_written por produto
+```
+
+## Para que?
+
+Esses objetos formam a interface natural para o próximo componente:
+
+```text
+pipeline
+```
+
+Em vez de uma camada depender internamente da implementação da anterior:
+
+```text
+pipeline
+   ↓
+resultados explícitos
+   ↓
+próxima camada
+```
+
+---
+
+# 180. Próximo problema antes da criação do pipeline
+
+Embora Bronze, Silver e Gold já estejam implementadas individualmente, existe uma diferença semântica importante que precisa ser resolvida antes do pipeline.
+
+Atualmente a Silver recebe:
+
+```python
+batch_ids = None
+```
+
+ou:
+
+```python
+batch_ids = ...
+```
+
+A lógica atual considera:
+
+```python
+requested_incremental = bool(normalized_batch_ids)
+```
+
+Portanto:
+
+```text
+batch_ids = ()
+```
+
+produz:
+
+```text
+requested_incremental = False
+        ↓
+FULL
+```
+
+## Por que isso se torna um problema no pipeline?
+
+A Bronze pode executar sem encontrar novos arquivos:
+
+```text
+inbox vazio
+        ↓
+BronzeLoadResult.batch_ids = ()
+```
+
+O pipeline naturalmente deverá fazer:
+
+```text
+BronzeLoadResult.batch_ids
+        ↓
+Silver
+```
+
+Mas com a regra atual:
+
+```text
+nenhum batch novo
+        ↓
+Silver FULL
+```
+
+Isso causaria rebuild completo desnecessário a cada execução vazia.
+
+---
+
+# 181. Semântica desejada para `batch_ids` na Silver
+
+Antes da orquestração ponta a ponta, a Silver deve distinguir:
+
+```text
+batch_ids = None
+```
+
+de:
+
+```text
+batch_ids = ()
+```
+
+A semântica desejada é:
+
+```text
+batch_ids=None
+        ↓
+FULL explícito
+```
+
+enquanto:
+
+```text
+batch_ids=()
++
+Silver completa
+        ↓
+NOOP
+```
+
+Se:
+
+```text
+batch_ids=()
++
+Silver incompleta
+```
+
+o comportamento deve continuar sendo:
+
+```text
+FULL
+```
+
+para permitir recuperação.
+
+Assim:
+
+```text
+None
+→ quero rebuild completo
+
+()
+→ não existe novo batch
+
+("batch-x",)
+→ existem novos batches
+```
+
+---
+
+# 182. Próximo passo recomendado — preparar Silver para o pipeline
+
+O próximo passo deve alterar a decisão inicial de:
+
+```python
+load_silver_data(...)
+```
+
+para separar:
+
+```text
+rebuild explícito
+incremental
+nenhum batch novo
+recovery
+```
+
+A regra esperada é:
+
+```text
+batch_ids is None
+        ↓
+FULL
+```
+
+```text
+batch_ids == ()
++
+Silver completa
+        ↓
+NOOP
+```
+
+```text
+batch_ids == ()
++
+Silver incompleta
+        ↓
+FULL
+```
+
+```text
+batch_ids possui valores
++
+Silver completa
+        ↓
+INCREMENTAL
+```
+
+```text
+batch_ids possui valores
++
+Silver incompleta
+        ↓
+FULL
+```
+
+Um teste de integração deverá fixar especificamente:
+
+```text
+Silver já existe
++
+batch_ids=()
+        ↓
+SilverLoadResult.mode = NOOP
+```
+
+---
+
+# 183. Pipeline planejado
+
+Depois do ajuste anterior, poderá ser criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── pipeline/
+        └── service.py
+```
+
+A responsabilidade planejada é pequena:
+
+```text
+load_bronze(settings)
+        ↓
+BronzeLoadResult
+        │
+        └── batch_ids
+                ↓
+load_silver(
+    settings,
+    batch_ids=...
+)
+        ↓
+SilverLoadResult
+        │
+        ├── affected_event_dates
+        └── affected_rejection_dates
+                ↓
+load_gold(
+    settings,
+    silver_result=...
+)
+        ↓
+GoldLoadResult
+```
+
+O pipeline não deverá conhecer:
+
+```text
+hash de arquivo
+schema CSV
+DuckDB
+Delta MERGE
+predicates
+regras T1/T2
+partições Silver
+partições Gold
+```
+
+Ele deve apenas coordenar os contratos públicos das camadas.
+
+---
+
+# 184. Resultado esperado da futura orquestração
+
+A execução inicial deverá funcionar assim:
+
+```text
+CSV novo
+   ↓
+Bronze
+   ↓
+batch_id novo
+   ↓
+Silver FULL
+   ↓
+Gold FULL
+```
+
+Depois, com outro arquivo:
+
+```text
+novo CSV
+   ↓
+Bronze incremental
+   ↓
+novo batch_id
+   ↓
+Silver incremental
+   ↓
+affected dates
+   ↓
+Gold incremental
+```
+
+E quando não existir nada novo:
+
+```text
+inbox vazio
+   ↓
+Bronze sem novos batches
+   ↓
+Silver NOOP
+   ↓
+Gold NOOP
+```
+
+Esse será o primeiro fluxo realmente ponta a ponta:
+
+```text
+Raw
+ ↓
+Bronze
+ ↓
+Silver
+ ↓
+Gold
+```
+
+executado através de uma única interface.
+
+---
+
+# 185. Ponto atual de desenvolvimento
+
+O ponto atual do projeto passa a ser:
+
+```text
+Bronze
+████████████████████  concluída
+
+Silver
+████████████████████  concluída
+
+Gold
+████████████████████  concluída
+
+Pipeline
+░░░░░░░░░░░░░░░░░░░░  próximo
+
+Query Layer
+░░░░░░░░░░░░░░░░░░░░
+
+REST API
+░░░░░░░░░░░░░░░░░░░░
+
+MCP
+░░░░░░░░░░░░░░░░░░░░
+```
+
+Antes de implementar:
+
+```text
+pipeline/service.py
+```
+
+deve ser concluído o pequeno ajuste semântico da Silver relacionado a:
+
+```text
+batch_ids=()
+```
+
+Depois disso:
+
+```text
+BronzeLoadResult
+        ↓
+SilverLoadResult
+        ↓
+GoldLoadResult
+        ↓
+PipelineResult
+```
+
+passará a formar a cadeia completa de processamento da plataforma.
+
+Esse é o ponto exato para retomada do desenvolvimento.
+````
+
+[1]: https://github.com/Zuimbra/queo-data-platform/tree/main/src/queo_data_platform/pipeline "queo-data-platform/src/queo_data_platform/pipeline at main · Zuimbra/queo-data-platform · GitHub"
