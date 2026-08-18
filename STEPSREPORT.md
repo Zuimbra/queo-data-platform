@@ -7381,21 +7381,13 @@ O contrato Gold centraliza os nomes dos cinco produtos de dados planejados:
 ```python
 DIM_DEVICE_TABLE_NAME = "dim_device"
 
-DEVICE_LAST_POSITION_TABLE_NAME = (
-    "device_last_position"
-)
+DEVICE_LAST_POSITION_TABLE_NAME = "device_last_position"
 
-DEVICE_ROUTE_POINTS_TABLE_NAME = (
-    "device_route_points"
-)
+DEVICE_ROUTE_POINTS_TABLE_NAME = "device_route_points"
 
-DEVICE_DAILY_SUMMARY_TABLE_NAME = (
-    "device_daily_summary"
-)
+DEVICE_DAILY_SUMMARY_TABLE_NAME = "device_daily_summary"
 
-DATA_QUALITY_SUMMARY_TABLE_NAME = (
-    "data_quality_summary"
-)
+DATA_QUALITY_SUMMARY_TABLE_NAME = "data_quality_summary"
 ```
 
 A Gold passa, portanto, a possuir os seguintes produtos:
@@ -7492,23 +7484,16 @@ Também foi definido:
 ```python
 GOLD_EVENT_PARTITION_COLUMN = "event_date"
 
-GOLD_QUALITY_PARTITION_COLUMN = (
-    "metric_date"
-)
+GOLD_QUALITY_PARTITION_COLUMN = "metric_date"
 ```
 
 E:
 
 ```python
 GOLD_PARTITIONED_TABLES = {
-    DEVICE_ROUTE_POINTS_TABLE_NAME:
-        GOLD_EVENT_PARTITION_COLUMN,
-
-    DEVICE_DAILY_SUMMARY_TABLE_NAME:
-        GOLD_EVENT_PARTITION_COLUMN,
-
-    DATA_QUALITY_SUMMARY_TABLE_NAME:
-        GOLD_QUALITY_PARTITION_COLUMN,
+    DEVICE_ROUTE_POINTS_TABLE_NAME: GOLD_EVENT_PARTITION_COLUMN,
+    DEVICE_DAILY_SUMMARY_TABLE_NAME: GOLD_EVENT_PARTITION_COLUMN,
+    DATA_QUALITY_SUMMARY_TABLE_NAME: GOLD_QUALITY_PARTITION_COLUMN,
 }
 ```
 
@@ -7570,13 +7555,9 @@ SILVER_REJECTED_RELATION = "silver_rejected"
 E duas views intermediárias:
 
 ```python
-TELEMETRY_GOLD_BASE_VIEW = (
-    "telemetry_gold_base"
-)
+TELEMETRY_GOLD_BASE_VIEW = "telemetry_gold_base"
 
-IDENTITY_GOLD_BASE_VIEW = (
-    "identity_gold_base"
-)
+IDENTITY_GOLD_BASE_VIEW = "identity_gold_base"
 ```
 
 ## O que?
@@ -8064,9 +8045,7 @@ identity + telemetry
 `build_dim_device(...)` aceita:
 
 ```python
-affected_devices: (
-    tuple[str, ...] | None
-)
+affected_devices: tuple[str, ...] | None
 ```
 
 Quando informado, é registrada uma relação temporária:
@@ -8148,9 +8127,7 @@ Porém, o contrato real da Silver já estabelece timestamps tipados.
 Os testes passaram a utilizar:
 
 ```python
-pd.Timestamp(
-    "2026-08-16 08:00:00"
-)
+pd.Timestamp("2026-08-16 08:00:00")
 ```
 
 Assim:
