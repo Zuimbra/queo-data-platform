@@ -1,10 +1,13 @@
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
 import pyarrow as pa
+import pytest
 from deltalake import DeltaTable, write_deltalake
 
+from queo_data_platform.config.settings import Settings
 from queo_data_platform.contracts.gold import (
     DATA_QUALITY_SUMMARY_TABLE_NAME,
     DEVICE_DAILY_SUMMARY_TABLE_NAME,
@@ -20,7 +23,10 @@ from queo_data_platform.contracts.silver import (
     TELEMETRY_SCHEMA,
     TELEMETRY_TABLE_NAME,
 )
-from queo_data_platform.gold.service import load_gold_data
+from queo_data_platform.gold.service import (
+    load_gold,
+    load_gold_data,
+)
 from queo_data_platform.silver.service import SilverLoadResult
 
 
@@ -305,6 +311,7 @@ def test_gold_returns_noop_when_silver_has_no_changes(
     assert not result.has_changes
 
     assert result.dim_device_rows_written == 0
+
     assert result.route_points_rows_written == 0
 
 
@@ -373,3 +380,211 @@ def test_incremental_gold_rebuilds_only_affected_date(
     day_17_summary = daily.loc[daily["event_date"] == "2026-08-17"].iloc[0]
 
     assert day_17_summary["message_count"] == 2
+
+
+def test_incremental_gold_updates_only_unknown_quality_partition(
+    tmp_path: Path,
+) -> None:
+    silver_dir = tmp_path / "02_silver"
+    gold_dir = tmp_path / "03_gold"
+
+    create_silver_sources(silver_dir)
+
+    load_gold_data(
+        silver_dir=silver_dir,
+        gold_dir=gold_dir,
+    )
+
+    write_silver_table(
+        silver_dir / REJECTED_LOGS_TABLE_NAME,
+        [
+            build_rejected_row(
+                row_id="rejected-unknown",
+                rejection_date="unknown",
+            )
+        ],
+        schema=REJECTED_LOGS_SCHEMA,
+        partition_by="rejection_date",
+        mode="append",
+    )
+
+    silver_result = SilverLoadResult(
+        mode="INCREMENTAL",
+        batch_ids=("batch-unknown",),
+        affected_event_dates=(),
+        affected_rejection_dates=("unknown",),
+        telemetry_rows_written=0,
+        identity_rows_written=0,
+        rejected_rows_written=1,
+    )
+
+    result = load_gold_data(
+        silver_dir=silver_dir,
+        gold_dir=gold_dir,
+        silver_result=silver_result,
+    )
+
+    assert result.mode == "INCREMENTAL"
+
+    assert result.affected_event_dates == ()
+
+    assert result.affected_rejection_dates == ("unknown",)
+
+    assert result.affected_quality_dates == ("unknown",)
+
+    assert result.affected_devices == ()
+
+    assert result.dim_device_rows_written == 0
+
+    assert result.last_position_rows_written == 0
+
+    assert result.route_points_rows_written == 0
+
+    assert result.daily_summary_rows_written == 0
+
+    assert result.quality_summary_rows_written == 1
+
+    quality = DeltaTable(str(gold_dir / DATA_QUALITY_SUMMARY_TABLE_NAME)).to_pandas()
+
+    unknown = quality.loc[quality["metric_date"] == "unknown"]
+
+    assert len(unknown) == 1
+
+    row = unknown.iloc[0]
+
+    assert row["rejected_event_count"] == 1
+
+    assert row["invalid_message_type_count"] == 1
+
+    assert row["total_event_count"] == 1
+
+    assert row["rejection_percentage"] == 100.0
+
+
+def test_incomplete_gold_forces_full_rebuild_even_after_silver_noop(
+    tmp_path: Path,
+) -> None:
+    silver_dir = tmp_path / "02_silver"
+    gold_dir = tmp_path / "03_gold"
+
+    create_silver_sources(silver_dir)
+
+    first_result = load_gold_data(
+        silver_dir=silver_dir,
+        gold_dir=gold_dir,
+    )
+
+    assert first_result.mode == "FULL"
+
+    route_path = gold_dir / DEVICE_ROUTE_POINTS_TABLE_NAME
+
+    assert DeltaTable.is_deltatable(str(route_path))
+
+    shutil.rmtree(route_path)
+
+    assert not DeltaTable.is_deltatable(str(route_path))
+
+    silver_result = SilverLoadResult(
+        mode="NOOP",
+        batch_ids=(),
+        affected_event_dates=(),
+        affected_rejection_dates=(),
+        telemetry_rows_written=0,
+        identity_rows_written=0,
+        rejected_rows_written=0,
+    )
+
+    result = load_gold_data(
+        silver_dir=silver_dir,
+        gold_dir=gold_dir,
+        silver_result=silver_result,
+    )
+
+    assert result.mode == "FULL"
+    assert result.has_changes
+
+    assert DeltaTable.is_deltatable(str(route_path))
+
+    for table_name in (
+        DIM_DEVICE_TABLE_NAME,
+        DEVICE_LAST_POSITION_TABLE_NAME,
+        DEVICE_ROUTE_POINTS_TABLE_NAME,
+        DEVICE_DAILY_SUMMARY_TABLE_NAME,
+        DATA_QUALITY_SUMMARY_TABLE_NAME,
+    ):
+        assert DeltaTable.is_deltatable(str(gold_dir / table_name))
+
+
+def test_gold_requires_all_silver_tables(
+    tmp_path: Path,
+) -> None:
+    silver_dir = tmp_path / "02_silver"
+    gold_dir = tmp_path / "03_gold"
+
+    silver_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="Delta Tables Silver",
+    ):
+        load_gold_data(
+            silver_dir=silver_dir,
+            gold_dir=gold_dir,
+        )
+
+
+def build_test_settings(
+    tmp_path: Path,
+) -> Settings:
+    data_dir = tmp_path / "data"
+
+    raw_dir = data_dir / "raw"
+
+    lakehouse_dir = data_dir / "lakehouse"
+
+    return Settings(
+        project_root=tmp_path,
+        data_dir=data_dir,
+        raw_dir=raw_dir,
+        inbox_dir=(raw_dir / "inbox"),
+        archive_dir=(raw_dir / "archive"),
+        quarantine_dir=(raw_dir / "quarantine"),
+        lakehouse_dir=lakehouse_dir,
+        control_dir=(lakehouse_dir / "00_control"),
+        bronze_dir=(lakehouse_dir / "01_bronze"),
+        silver_dir=(lakehouse_dir / "02_silver"),
+        gold_dir=(lakehouse_dir / "03_gold"),
+    )
+
+
+def test_load_gold_uses_settings_paths(
+    tmp_path: Path,
+) -> None:
+    settings = build_test_settings(tmp_path)
+
+    create_silver_sources(settings.silver_dir)
+
+    result = load_gold(settings)
+
+    assert result.mode == "FULL"
+
+    assert DeltaTable.is_deltatable(str(settings.gold_dir / DIM_DEVICE_TABLE_NAME))
+
+    assert DeltaTable.is_deltatable(
+        str(settings.gold_dir / DEVICE_LAST_POSITION_TABLE_NAME)
+    )
+
+    assert DeltaTable.is_deltatable(
+        str(settings.gold_dir / DEVICE_ROUTE_POINTS_TABLE_NAME)
+    )
+
+    assert DeltaTable.is_deltatable(
+        str(settings.gold_dir / DEVICE_DAILY_SUMMARY_TABLE_NAME)
+    )
+
+    assert DeltaTable.is_deltatable(
+        str(settings.gold_dir / DATA_QUALITY_SUMMARY_TABLE_NAME)
+    )

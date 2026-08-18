@@ -104,6 +104,20 @@ class GoldProducts:
     quality_summary: pa.Table
 
 
+def empty_gold_table(
+    schema: pa.Schema,
+) -> pa.Table:
+    """
+    Cria um produto Gold vazio preservando
+    exatamente o schema oficial.
+    """
+
+    return pa.Table.from_batches(
+        [],
+        schema=schema,
+    )
+
+
 @dataclass(frozen=True)
 class GoldLoadResult:
     """
@@ -319,43 +333,70 @@ def build_gold_products(
     Executa os cinco builders Gold.
 
     FULL:
-        sem filtros.
+        reconstrói todos os produtos usando
+        todo o estado atual da Silver.
 
     INCREMENTAL:
-        filtra cada produto usando o escopo
-        apropriado.
+        executa somente os builders realmente
+        afetados pelo escopo.
     """
 
     if full_rebuild:
         return GoldProducts(
             dim_device=build_dim_device(connection),
-            last_position=build_device_last_position(connection),
-            route_points=build_device_route_points(connection),
-            daily_summary=build_device_daily_summary(connection),
-            quality_summary=build_data_quality_summary(connection),
+            last_position=(build_device_last_position(connection)),
+            route_points=(build_device_route_points(connection)),
+            daily_summary=(build_device_daily_summary(connection)),
+            quality_summary=(build_data_quality_summary(connection)),
         )
 
+    if scope.affected_devices:
+        dim_device = build_dim_device(
+            connection,
+            affected_devices=(scope.affected_devices),
+        )
+
+        last_position = build_device_last_position(
+            connection,
+            affected_devices=(scope.affected_devices),
+        )
+
+    else:
+        dim_device = empty_gold_table(DIM_DEVICE_SCHEMA)
+
+        last_position = empty_gold_table(DEVICE_LAST_POSITION_SCHEMA)
+
+    if scope.event_dates:
+        route_points = build_device_route_points(
+            connection,
+            event_dates=(scope.event_dates),
+        )
+
+        daily_summary = build_device_daily_summary(
+            connection,
+            event_dates=(scope.event_dates),
+        )
+
+    else:
+        route_points = empty_gold_table(DEVICE_ROUTE_POINTS_SCHEMA)
+
+        daily_summary = empty_gold_table(DEVICE_DAILY_SUMMARY_SCHEMA)
+
+    if scope.quality_dates:
+        quality_summary = build_data_quality_summary(
+            connection,
+            metric_dates=(scope.quality_dates),
+        )
+
+    else:
+        quality_summary = empty_gold_table(DATA_QUALITY_SUMMARY_SCHEMA)
+
     return GoldProducts(
-        dim_device=build_dim_device(
-            connection,
-            affected_devices=scope.affected_devices,
-        ),
-        last_position=build_device_last_position(
-            connection,
-            affected_devices=scope.affected_devices,
-        ),
-        route_points=build_device_route_points(
-            connection,
-            event_dates=scope.event_dates,
-        ),
-        daily_summary=build_device_daily_summary(
-            connection,
-            event_dates=scope.event_dates,
-        ),
-        quality_summary=build_data_quality_summary(
-            connection,
-            metric_dates=scope.quality_dates,
-        ),
+        dim_device=dim_device,
+        last_position=last_position,
+        route_points=route_points,
+        daily_summary=daily_summary,
+        quality_summary=quality_summary,
     )
 
 
