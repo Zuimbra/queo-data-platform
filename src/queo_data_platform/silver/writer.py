@@ -15,10 +15,13 @@ def dataframe_to_arrow(
     schema: pa.Schema,
 ) -> pa.Table:
     """
-    Converte um DataFrame Silver usando schema explícito.
+    Converte um DataFrame Silver usando
+    o schema explícito do contrato.
 
-    Isso evita NullType e inferências incorretas de tipo,
-    especialmente quando o produto Silver está vazio.
+    Colunas totalmente nulas recebem diretamente
+    o tipo definido no schema, evitando que tipos
+    inferidos pelo Pandas/DuckDB contaminem a
+    persistência Silver.
     """
 
     missing_columns = [
@@ -39,11 +42,29 @@ def dataframe_to_arrow(
 
     aligned = dataframe.reindex(columns=schema.names)
 
-    return pa.Table.from_pandas(
-        aligned,
+    arrays: list[pa.Array] = []
+
+    for field in schema:
+        column = aligned[field.name]
+
+        if column.isna().all():
+            array = pa.nulls(
+                len(column),
+                type=field.type,
+            )
+        else:
+            array = pa.array(
+                column,
+                type=field.type,
+                from_pandas=True,
+                safe=True,
+            )
+
+        arrays.append(array)
+
+    return pa.Table.from_arrays(
+        arrays,
         schema=schema,
-        preserve_index=False,
-        safe=True,
     )
 
 

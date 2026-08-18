@@ -454,3 +454,50 @@ def test_silver_can_run_from_settings(
     assert set(telemetry["row_id"]) == {
         "row-settings",
     }
+
+
+def test_empty_batch_ids_return_noop_when_silver_exists(
+    tmp_path: Path,
+) -> None:
+    bronze_dir = tmp_path / "01_bronze"
+
+    silver_dir = tmp_path / "02_silver"
+
+    write_bronze_rows(
+        bronze_dir,
+        [
+            build_bronze_row(
+                row_id="row-1",
+                batch_id="batch-001",
+                event_date="2026-08-17",
+            )
+        ],
+    )
+
+    first_result = load_silver_data(
+        bronze_dir=bronze_dir,
+        silver_dir=silver_dir,
+    )
+
+    assert first_result.mode == "FULL"
+
+    result = load_silver_data(
+        bronze_dir=bronze_dir,
+        silver_dir=silver_dir,
+        batch_ids=(),
+    )
+
+    assert result.mode == "NOOP"
+    assert not result.has_changes
+
+    assert result.batch_ids == ()
+
+    assert result.affected_event_dates == ()
+
+    assert result.affected_rejection_dates == ()
+
+    assert result.telemetry_rows_written == 0
+
+    assert result.identity_rows_written == 0
+
+    assert result.rejected_rows_written == 0

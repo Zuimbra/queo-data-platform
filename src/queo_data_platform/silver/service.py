@@ -270,13 +270,32 @@ def load_silver_data(
 
     bronze_table = load_bronze_table(paths.bronze)
 
-    normalized_batch_ids = normalize_batch_ids(batch_ids)
+    normalized_batch_ids = normalize_batch_ids(
+        batch_ids,
+    )
 
-    requested_incremental = bool(normalized_batch_ids)
+    requested_full_rebuild = batch_ids is None
 
-    incremental_supported = silver_supports_incremental_update(paths)
+    incremental_supported = silver_supports_incremental_update(
+        paths,
+    )
 
-    full_rebuild = not requested_incremental or not incremental_supported
+    if requested_full_rebuild or not incremental_supported:
+        full_rebuild = True
+
+    elif not normalized_batch_ids:
+        return SilverLoadResult(
+            mode="NOOP",
+            batch_ids=(),
+            affected_event_dates=(),
+            affected_rejection_dates=(),
+            telemetry_rows_written=0,
+            identity_rows_written=0,
+            rejected_rows_written=0,
+        )
+
+    else:
+        full_rebuild = False
 
     # --------------------------------------------------
     # DEFINE O ESCOPO BRONZE

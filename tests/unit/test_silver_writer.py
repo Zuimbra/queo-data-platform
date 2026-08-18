@@ -226,3 +226,27 @@ def test_empty_dataframe_uses_explicit_schema() -> None:
     assert table.schema.field("device_serial").type == pa.string()
 
     assert table.schema.field("value").type == pa.float64()
+
+
+def test_dataframe_to_arrow_handles_all_null_column_with_wrong_pandas_dtype() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "event_date": ["2026-08-17"],
+            "device_serial": pd.Series(
+                [pd.NA],
+                dtype="Int32",
+            ),
+            "value": [1.0],
+        }
+    )
+
+    table = dataframe_to_arrow(
+        dataframe,
+        TEST_SCHEMA,
+    )
+
+    assert table.num_rows == 1
+
+    assert table.schema.field("device_serial").type == pa.string()
+
+    assert table["device_serial"].to_pylist() == [None]
