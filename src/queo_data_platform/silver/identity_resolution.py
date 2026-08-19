@@ -241,6 +241,119 @@ def build_unambiguous_legacy_file_imei_map(
     }
 
 
+def validate_identity_event_reference_input(
+    dataframe: pd.DataFrame,
+) -> None:
+    """
+    Confirma que um produto Silver de identidade possui
+    as evidências mínimas necessárias para servir como
+    referência histórica de IMEI -> serial.
+    """
+
+    required_columns = (
+        "device_serial_raw",
+        "imei",
+    )
+
+    missing_columns = [
+        column for column in required_columns if column not in dataframe.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "A referência histórica de identidade não possui "
+            "todas as colunas necessárias: "
+            f"{missing_columns}"
+        )
+
+
+def build_unambiguous_imei_to_serial_map_from_identity_events(
+    dataframe: pd.DataFrame,
+) -> dict[str, str]:
+    """
+    Constrói relações IMEI -> serial a partir do produto
+    Silver device_identity_events já persistido.
+
+    Somente device_serial_raw é utilizado como evidência
+    de identidade direta.
+
+    Isso evita que uma identidade previamente inferida
+    seja utilizada para justificar outra inferência.
+    """
+
+    validate_identity_event_reference_input(dataframe)
+
+    candidates: dict[
+        str,
+        set[str],
+    ] = {}
+
+    for record in dataframe.to_dict(orient="records"):
+        device_serial = normalize_device_serial(record.get("device_serial_raw"))
+
+        if device_serial is None:
+            continue
+
+        imei = normalize_imei(record.get("imei"))
+
+        if imei is None:
+            continue
+
+        candidates.setdefault(
+            imei,
+            set(),
+        ).add(device_serial)
+
+    return {
+        imei: next(iter(serials))
+        for imei, serials in candidates.items()
+        if len(serials) == 1
+    }
+
+
+def merge_unambiguous_imei_to_serial_maps(
+    *mappings: Mapping[str, str],
+) -> dict[str, str]:
+    """
+    Combina múltiplas fontes de IMEI -> serial.
+
+    Uma associação somente permanece utilizável quando,
+    considerando todas as fontes, o IMEI continua
+    apontando para exatamente um único serial.
+
+    Se qualquer fonte introduzir conflito, a associação
+    é descartada.
+    """
+
+    candidates: dict[
+        str,
+        set[str],
+    ] = {}
+
+    for mapping in mappings:
+        for raw_imei, raw_serial in mapping.items():
+            imei = normalize_imei(raw_imei)
+
+            if imei is None:
+                continue
+
+            device_serial = normalize_device_serial(raw_serial)
+
+            if device_serial is None:
+                continue
+
+            candidates.setdefault(
+                imei,
+                set(),
+            ).add(device_serial)
+
+    return {
+        imei: next(iter(serials))
+        for imei, serials in candidates.items()
+        if len(serials) == 1
+    }
+
+
 def resolve_identity_dataframe(
     dataframe: pd.DataFrame,
     *,
@@ -320,12 +433,21 @@ def resolve_identity_dataframe(
 
             continue
 
-        source_file = record.get("source_file")
+        source_file_raw = record.get("source_file")
 
         if not isinstance(
-            source_file,
+            source_file_raw,
             str,
         ):
+            resolved_serials.append(None)
+
+            resolution_methods.append("UNRESOLVED")
+
+            continue
+
+        source_file = source_file_raw.strip()
+
+        if not source_file:
             resolved_serials.append(None)
 
             resolution_methods.append("UNRESOLVED")
