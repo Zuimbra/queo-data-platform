@@ -23,6 +23,12 @@ from queo_data_platform.silver.service import (
     load_silver_data,
 )
 
+KNOWN_IMEI = "354173560222769"
+
+KNOWN_DEVICE_SERIAL = "202527000021P"
+
+KNOWN_DEVICE_SERIAL_RAW = "M202527000021P"
+
 
 def build_bronze_row(
     *,
@@ -37,8 +43,8 @@ def build_bronze_row(
 
     row.update(
         {
-            "DATA_SERVIDOR": (f"{event_date} 12:00:00"),
-            "TM_STAMP": (f"{event_date} 11:59:50"),
+            "DATA_SERVIDOR": f"{event_date} 12:00:00",
+            "TM_STAMP": f"{event_date} 11:59:50",
             "TIPO_LOG": "tracker",
             "MESS_TYPE": message_type,
             "REPT_TYPE": "1",
@@ -64,8 +70,8 @@ def build_bronze_row(
             "TEMP_2": "26",
             "TEMP_3": "27",
             "TEMP_4": "28",
-            "source_file": (f"{batch_id}.csv"),
-            "source_file_hash": (f"hash-{batch_id}"),
+            "source_file": f"{batch_id}.csv",
+            "source_file_hash": f"hash-{batch_id}",
             "source_row_number": 1,
             "row_id": row_id,
             "batch_id": batch_id,
@@ -189,6 +195,163 @@ def test_full_rebuild_creates_silver_products(
     assert len(telemetry) == 1
     assert len(identity) == 1
     assert len(rejected) == 1
+
+
+def test_full_rebuild_resolves_legacy_identity(
+    tmp_path: Path,
+) -> None:
+    bronze_dir = tmp_path / "01_bronze"
+
+    silver_dir = tmp_path / "02_silver"
+
+    modern_identity = build_bronze_row(
+        row_id="modern-identity",
+        batch_id="batch-modern",
+        event_date="2026-08-17",
+        message_type="T1",
+    )
+
+    modern_identity["S/N ou IMEI"] = KNOWN_DEVICE_SERIAL_RAW
+
+    modern_identity["LONT"] = KNOWN_IMEI
+
+    legacy_identity = build_bronze_row(
+        row_id="legacy-identity",
+        batch_id="batch-legacy",
+        event_date="2026-08-18",
+        message_type="T1",
+    )
+
+    legacy_identity["PRT_VER"] = "V14.06.111"
+
+    legacy_identity["S/N ou IMEI"] = ""
+
+    legacy_identity["LONT"] = KNOWN_IMEI
+
+    legacy_identity["source_file"] = "legacy.csv"
+
+    legacy_telemetry = build_bronze_row(
+        row_id="legacy-telemetry",
+        batch_id="batch-legacy",
+        event_date="2026-08-18",
+        message_type="T2",
+    )
+
+    legacy_telemetry["PRT_VER"] = "V14.06.111"
+
+    legacy_telemetry["S/N ou IMEI"] = ""
+
+    legacy_telemetry["source_file"] = "legacy.csv"
+
+    write_bronze_rows(
+        bronze_dir,
+        [
+            modern_identity,
+            legacy_identity,
+            legacy_telemetry,
+        ],
+    )
+
+    result = load_silver_data(
+        bronze_dir=bronze_dir,
+        silver_dir=silver_dir,
+    )
+
+    assert result.mode == "FULL"
+
+    telemetry = DeltaTable(str(silver_dir / TELEMETRY_TABLE_NAME)).to_pandas()
+
+    legacy = telemetry.loc[telemetry["row_id"] == "legacy-telemetry"].iloc[0]
+
+    assert legacy["device_serial"] == KNOWN_DEVICE_SERIAL
+
+    assert legacy["device_resolution_method"] == "LEGACY_IMEI"
+
+
+def test_incremental_resolves_legacy_identity_from_history(
+    tmp_path: Path,
+) -> None:
+    bronze_dir = tmp_path / "01_bronze"
+
+    silver_dir = tmp_path / "02_silver"
+
+    modern_identity = build_bronze_row(
+        row_id="modern-identity",
+        batch_id="batch-old",
+        event_date="2026-08-17",
+        message_type="T1",
+    )
+
+    modern_identity["S/N ou IMEI"] = KNOWN_DEVICE_SERIAL_RAW
+
+    modern_identity["LONT"] = KNOWN_IMEI
+
+    write_bronze_rows(
+        bronze_dir,
+        [
+            modern_identity,
+        ],
+    )
+
+    first_result = load_silver_data(
+        bronze_dir=bronze_dir,
+        silver_dir=silver_dir,
+    )
+
+    assert first_result.mode == "FULL"
+
+    legacy_identity = build_bronze_row(
+        row_id="legacy-identity",
+        batch_id="batch-new",
+        event_date="2026-08-18",
+        message_type="T1",
+    )
+
+    legacy_identity["PRT_VER"] = "V14.06.111"
+
+    legacy_identity["S/N ou IMEI"] = ""
+
+    legacy_identity["LONT"] = KNOWN_IMEI
+
+    legacy_identity["source_file"] = "legacy.csv"
+
+    legacy_telemetry = build_bronze_row(
+        row_id="legacy-telemetry",
+        batch_id="batch-new",
+        event_date="2026-08-18",
+        message_type="T2",
+    )
+
+    legacy_telemetry["PRT_VER"] = "V14.06.111"
+
+    legacy_telemetry["S/N ou IMEI"] = ""
+
+    legacy_telemetry["source_file"] = "legacy.csv"
+
+    write_bronze_rows(
+        bronze_dir,
+        [
+            legacy_identity,
+            legacy_telemetry,
+        ],
+        mode="append",
+    )
+
+    result = load_silver_data(
+        bronze_dir=bronze_dir,
+        silver_dir=silver_dir,
+        batch_ids=("batch-new",),
+    )
+
+    assert result.mode == "INCREMENTAL"
+
+    telemetry = DeltaTable(str(silver_dir / TELEMETRY_TABLE_NAME)).to_pandas()
+
+    legacy = telemetry.loc[telemetry["row_id"] == "legacy-telemetry"].iloc[0]
+
+    assert legacy["device_serial"] == KNOWN_DEVICE_SERIAL
+
+    assert legacy["device_resolution_method"] == "LEGACY_IMEI"
 
 
 def test_unknown_batch_returns_noop(

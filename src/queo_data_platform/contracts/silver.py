@@ -40,6 +40,10 @@ TELEMETRY_SCHEMA = pa.schema(
         pa.field("report_type", pa.int32()),
         pa.field("protocol_version", pa.string()),
         pa.field("device_serial", pa.string()),
+        pa.field(
+            "device_resolution_method",
+            pa.string(),
+        ),
         pa.field("terminal_status", pa.string()),
         pa.field("battery_voltage", pa.float64()),
         pa.field("location_status", pa.string()),
@@ -94,6 +98,10 @@ DEVICE_IDENTITY_SCHEMA = pa.schema(
         pa.field("protocol_version", pa.string()),
         pa.field("device_serial_raw", pa.string()),
         pa.field("device_serial", pa.string()),
+        pa.field(
+            "device_resolution_method",
+            pa.string(),
+        ),
         pa.field("iccid", pa.string()),
         pa.field("identity_auxiliary", pa.string()),
         pa.field("imsi", pa.string()),
@@ -165,6 +173,14 @@ REJECTED_LOGS_SCHEMA = pa.schema(
             SILVER_TIMESTAMP,
         ),
         *[pa.field(column, pa.string()) for column in REJECTED_TEXT_COLUMNS],
+        pa.field(
+            "device_serial",
+            pa.string(),
+        ),
+        pa.field(
+            "device_resolution_method",
+            pa.string(),
+        ),
         pa.field("source_file", pa.string()),
         pa.field("source_file_hash", pa.string()),
         pa.field("source_row_number", pa.int64()),

@@ -14,6 +14,8 @@ def validate_telemetry_input(
         "report_type_raw",
         "protocol_version",
         "device_serial_raw",
+        "device_serial",
+        "device_resolution_method",
         "battery_voltage_raw",
         "location_status_raw",
         "latitude_raw",
@@ -61,6 +63,8 @@ def validate_identity_input(
         "report_type_raw",
         "protocol_version",
         "device_serial_raw",
+        "device_serial",
+        "device_resolution_method",
         "battery_voltage_raw",
         "location_status_raw",
         "latitude_raw",
@@ -87,6 +91,10 @@ def transform_telemetry_dataframe(
     Converte candidatos de telemetria no produto Silver tipado.
 
     Conversões inválidas resultam em NULL, preservando o registro.
+
+    A identidade do dispositivo já deve ter sido resolvida antes
+    desta etapa. device_serial e device_resolution_method são
+    apenas preservados pela transformação.
     """
 
     validate_telemetry_input(dataframe)
@@ -119,11 +127,8 @@ def transform_telemetry_dataframe(
 
                     protocol_version,
 
-                    REGEXP_REPLACE(
-                        device_serial_raw,
-                        '^M',
-                        ''
-                    ) AS device_serial,
+                    device_serial,
+                    device_resolution_method,
 
                     terminal_status,
 
@@ -274,6 +279,9 @@ def transform_identity_dataframe(
 ) -> pd.DataFrame:
     """
     Converte mensagens T1 no produto Silver de identidade.
+
+    A identidade canônica do dispositivo já deve ter sido
+    resolvida antes desta etapa.
     """
 
     validate_identity_input(dataframe)
@@ -306,12 +314,8 @@ def transform_identity_dataframe(
                     protocol_version,
 
                     device_serial_raw,
-
-                    REGEXP_REPLACE(
-                        device_serial_raw,
-                        '^M',
-                        ''
-                    ) AS device_serial,
+                    device_serial,
+                    device_resolution_method,
 
                     battery_voltage_raw
                         AS iccid,

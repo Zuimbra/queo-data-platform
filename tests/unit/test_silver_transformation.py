@@ -21,6 +21,8 @@ def build_classified_row(
         "report_type_raw": ["1"],
         "protocol_version": ["1"],
         "device_serial_raw": ["M123456789"],
+        "device_serial": ["123456789"],
+        "device_resolution_method": ["DIRECT"],
         "terminal_status": ["OK"],
         "battery_voltage_raw": ["12.5"],
         "location_status_raw": ["A"],
@@ -92,17 +94,38 @@ def test_invalid_numeric_value_becomes_null() -> None:
         )
     )
 
-    assert pd.isna(result.loc[0, "speed"])
+    assert pd.isna(
+        result.loc[
+            0,
+            "speed",
+        ]
+    )
 
 
-def test_device_serial_prefix_is_removed() -> None:
+def test_resolved_device_serial_is_preserved() -> None:
     result = transform_telemetry_dataframe(
         build_classified_row(
             device_serial_raw="M123456789",
+            device_serial="123456789",
+            device_resolution_method="DIRECT",
         )
     )
 
-    assert result.loc[0, "device_serial"] == "123456789"
+    assert (
+        result.loc[
+            0,
+            "device_serial",
+        ]
+        == "123456789"
+    )
+
+    assert (
+        result.loc[
+            0,
+            "device_resolution_method",
+        ]
+        == "DIRECT"
+    )
 
 
 def test_valid_coordinates_are_identified() -> None:
@@ -115,7 +138,13 @@ def test_valid_coordinates_are_identified() -> None:
         ]
     )
 
-    assert result.loc[0, "position_quality"] == "VALID"
+    assert (
+        result.loc[
+            0,
+            "position_quality",
+        ]
+        == "VALID"
+    )
 
 
 def test_missing_coordinates_are_identified() -> None:
@@ -132,7 +161,13 @@ def test_missing_coordinates_are_identified() -> None:
         ]
     )
 
-    assert result.loc[0, "position_quality"] == "MISSING_COORDINATES"
+    assert (
+        result.loc[
+            0,
+            "position_quality",
+        ]
+        == "MISSING_COORDINATES"
+    )
 
 
 def test_invalid_coordinates_are_identified() -> None:
@@ -149,7 +184,13 @@ def test_invalid_coordinates_are_identified() -> None:
         ]
     )
 
-    assert result.loc[0, "position_quality"] == "INVALID_COORDINATES"
+    assert (
+        result.loc[
+            0,
+            "position_quality",
+        ]
+        == "INVALID_COORDINATES"
+    )
 
 
 def test_high_hdop_marks_low_precision() -> None:
@@ -166,7 +207,13 @@ def test_high_hdop_marks_low_precision() -> None:
         ]
     )
 
-    assert result.loc[0, "position_quality"] == "LOW_GPS_PRECISION"
+    assert (
+        result.loc[
+            0,
+            "position_quality",
+        ]
+        == "LOW_GPS_PRECISION"
+    )
 
 
 def test_identity_fields_are_extracted_from_t1_positions() -> None:
@@ -180,11 +227,29 @@ def test_identity_fields_are_extracted_from_t1_positions() -> None:
 
     result = transform_identity_dataframe(dataframe)
 
-    assert result.loc[0, "iccid"] == "8955000000000000001"
+    assert (
+        result.loc[
+            0,
+            "iccid",
+        ]
+        == "8955000000000000001"
+    )
 
-    assert result.loc[0, "imsi"] == "724000000000001"
+    assert (
+        result.loc[
+            0,
+            "imsi",
+        ]
+        == "724000000000001"
+    )
 
-    assert result.loc[0, "imei"] == "359000000000001"
+    assert (
+        result.loc[
+            0,
+            "imei",
+        ]
+        == "359000000000001"
+    )
 
 
 def test_valid_identity_formats_are_detected() -> None:
@@ -254,7 +319,26 @@ def test_invalid_identity_formats_are_detected() -> None:
 def test_lineage_is_preserved_in_telemetry() -> None:
     result = transform_telemetry_dataframe(build_classified_row())
 
-    assert result.loc[0, "row_id"] == "row-001"
-    assert result.loc[0, "batch_id"] == "batch-001"
+    assert (
+        result.loc[
+            0,
+            "row_id",
+        ]
+        == "row-001"
+    )
 
-    assert result.loc[0, "source_file"] == "tracker.csv"
+    assert (
+        result.loc[
+            0,
+            "batch_id",
+        ]
+        == "batch-001"
+    )
+
+    assert (
+        result.loc[
+            0,
+            "source_file",
+        ]
+        == "tracker.csv"
+    )

@@ -33,6 +33,8 @@ def validate_normalized_input(
         "device_timestamp",
         "message_type",
         "device_serial_raw",
+        "device_serial",
+        "device_resolution_method",
         "row_id",
         "batch_id",
     )
@@ -60,17 +62,21 @@ def classify_normalized_dataframe(
         message_type segue T<n>,
         não é T1,
         possui timestamp,
-        possui serial do dispositivo.
+        possui identidade resolvida do dispositivo.
 
     Identidade:
         message_type é T1,
         possui timestamp,
-        possui serial do dispositivo.
+        possui identidade resolvida do dispositivo.
 
     Rejeição:
         message_type ausente ou inválido,
         timestamp ausente/inválido,
-        serial do dispositivo ausente.
+        identidade resolvida do dispositivo ausente.
+
+    A classificação utiliza device_serial como identidade canônica.
+    device_serial_raw é preservado apenas como informação de origem
+    para auditoria e rastreabilidade.
     """
 
     validate_normalized_input(dataframe)
@@ -111,7 +117,7 @@ def classify_normalized_dataframe(
                     ) IS NULL
                     THEN 'MISSING_OR_INVALID_TIMESTAMP'
 
-                    WHEN device_serial_raw IS NULL
+                    WHEN device_serial IS NULL
                     THEN 'MISSING_DEVICE_SERIAL'
 
                     ELSE NULL

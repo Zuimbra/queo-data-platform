@@ -50,3 +50,11 @@ def test_silver_partition_columns_are_strings() -> None:
     assert DEVICE_IDENTITY_SCHEMA.field("event_date").type == pa.string()
 
     assert REJECTED_LOGS_SCHEMA.field("rejection_date").type == pa.string()
+
+
+def test_identity_resolution_method_is_persisted() -> None:
+    assert TELEMETRY_SCHEMA.field("device_resolution_method").type == pa.string()
+
+    assert DEVICE_IDENTITY_SCHEMA.field("device_resolution_method").type == pa.string()
+
+    assert REJECTED_LOGS_SCHEMA.field("device_resolution_method").type == pa.string()

@@ -73,7 +73,7 @@ def test_imei_to_serial_map_keeps_unambiguous_relation() -> None:
 
     result = build_unambiguous_imei_to_serial_map(dataframe)
 
-    assert result == {KNOWN_IMEI: (KNOWN_DEVICE_SERIAL)}
+    assert result == {KNOWN_IMEI: KNOWN_DEVICE_SERIAL}
 
 
 def test_imei_to_serial_map_discards_ambiguous_relation() -> None:
@@ -81,12 +81,12 @@ def test_imei_to_serial_map_discards_ambiguous_relation() -> None:
         [
             build_normalized_row(
                 message_type="T1",
-                device_serial_raw=("MDEVICE-A"),
+                device_serial_raw="MDEVICE-A",
                 longitude_raw=KNOWN_IMEI,
             ),
             build_normalized_row(
                 message_type="T1",
-                device_serial_raw=("MDEVICE-B"),
+                device_serial_raw="MDEVICE-B",
                 longitude_raw=KNOWN_IMEI,
             ),
         ]
@@ -113,7 +113,7 @@ def test_legacy_file_map_accepts_single_distinct_imei() -> None:
 
     result = build_unambiguous_legacy_file_imei_map(dataframe)
 
-    assert result == {"logs_rastreador_2026-06-01.csv": (KNOWN_IMEI)}
+    assert result == {"logs_rastreador_2026-06-01.csv": KNOWN_IMEI}
 
 
 def test_legacy_file_map_discards_multiple_imeis() -> None:
@@ -125,7 +125,7 @@ def test_legacy_file_map_discards_multiple_imeis() -> None:
             ),
             build_normalized_row(
                 message_type="T1",
-                longitude_raw=("359000000000001"),
+                longitude_raw="359000000000001",
             ),
         ]
     )
@@ -186,7 +186,7 @@ def test_legacy_tracker_row_is_resolved_from_file_imei() -> None:
 
     resolved = resolve_identity_dataframe(
         dataframe,
-        imei_to_serial={KNOWN_IMEI: (KNOWN_DEVICE_SERIAL)},
+        imei_to_serial={KNOWN_IMEI: KNOWN_DEVICE_SERIAL},
     )
 
     assert pd.isna(
@@ -228,7 +228,7 @@ def test_external_traffic_does_not_inherit_file_identity() -> None:
 
     resolved = resolve_identity_dataframe(
         dataframe,
-        imei_to_serial={KNOWN_IMEI: (KNOWN_DEVICE_SERIAL)},
+        imei_to_serial={KNOWN_IMEI: KNOWN_DEVICE_SERIAL},
     )
 
     assert pd.isna(
@@ -264,7 +264,7 @@ def test_missing_timestamp_prevents_legacy_resolution() -> None:
 
     resolved = resolve_identity_dataframe(
         dataframe,
-        imei_to_serial={KNOWN_IMEI: (KNOWN_DEVICE_SERIAL)},
+        imei_to_serial={KNOWN_IMEI: KNOWN_DEVICE_SERIAL},
     )
 
     assert pd.isna(
@@ -332,7 +332,7 @@ def test_identity_events_build_historical_reference() -> None:
     assert result == {KNOWN_IMEI: KNOWN_DEVICE_SERIAL}
 
 
-def test_identity_events_ignore_inferred_identity_without_raw_serial() -> None:
+def test_inferred_identity_is_not_used_as_reference() -> None:
     dataframe = pd.DataFrame(
         [
             {
@@ -348,15 +348,15 @@ def test_identity_events_ignore_inferred_identity_without_raw_serial() -> None:
     assert result == {}
 
 
-def test_identity_events_discard_ambiguous_relation() -> None:
+def test_historical_reference_discards_ambiguity() -> None:
     dataframe = pd.DataFrame(
         [
             {
-                "device_serial_raw": ("MDEVICE-A"),
+                "device_serial_raw": "MDEVICE-A",
                 "imei": KNOWN_IMEI,
             },
             {
-                "device_serial_raw": ("MDEVICE-B"),
+                "device_serial_raw": "MDEVICE-B",
                 "imei": KNOWN_IMEI,
             },
         ]
@@ -367,19 +367,27 @@ def test_identity_events_discard_ambiguous_relation() -> None:
     assert result == {}
 
 
-def test_merge_identity_maps_preserves_same_relation() -> None:
+def test_merge_preserves_same_identity() -> None:
     result = merge_unambiguous_imei_to_serial_maps(
-        {KNOWN_IMEI: (KNOWN_DEVICE_SERIAL)},
-        {KNOWN_IMEI: (KNOWN_DEVICE_SERIAL_RAW)},
+        {
+            KNOWN_IMEI: KNOWN_DEVICE_SERIAL,
+        },
+        {
+            KNOWN_IMEI: (KNOWN_DEVICE_SERIAL_RAW),
+        },
     )
 
     assert result == {KNOWN_IMEI: KNOWN_DEVICE_SERIAL}
 
 
-def test_merge_identity_maps_discards_conflicting_relation() -> None:
+def test_merge_discards_conflicting_identity() -> None:
     result = merge_unambiguous_imei_to_serial_maps(
-        {KNOWN_IMEI: (KNOWN_DEVICE_SERIAL)},
-        {KNOWN_IMEI: ("ANOTHER-DEVICE")},
+        {
+            KNOWN_IMEI: KNOWN_DEVICE_SERIAL,
+        },
+        {
+            KNOWN_IMEI: "ANOTHER-DEVICE",
+        },
     )
 
     assert result == {}
@@ -391,18 +399,18 @@ def test_legacy_resolution_normalizes_source_file() -> None:
             build_normalized_row(
                 message_type="T1",
                 longitude_raw=KNOWN_IMEI,
-                source_file=("tracker-legacy.csv"),
+                source_file="tracker-legacy.csv",
             ),
             build_normalized_row(
                 message_type="T2",
-                source_file=(" tracker-legacy.csv "),
+                source_file=" tracker-legacy.csv ",
             ),
         ]
     )
 
     resolved = resolve_identity_dataframe(
         dataframe,
-        imei_to_serial={KNOWN_IMEI: (KNOWN_DEVICE_SERIAL)},
+        imei_to_serial={KNOWN_IMEI: KNOWN_DEVICE_SERIAL},
     )
 
     assert (

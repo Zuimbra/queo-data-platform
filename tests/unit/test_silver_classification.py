@@ -17,6 +17,8 @@ def build_normalized_dataframe(
         "device_timestamp": [pd.Timestamp("2026-08-17 11:59:50")],
         "message_type": ["T2"],
         "device_serial_raw": ["M123456789"],
+        "device_serial": ["123456789"],
+        "device_resolution_method": ["DIRECT"],
         "source_file": ["tracker.csv"],
         "source_file_hash": ["hash-001"],
         "source_row_number": [1],
@@ -156,6 +158,8 @@ def test_missing_timestamps_is_rejected_as_unknown_date() -> None:
 def test_missing_device_serial_is_rejected() -> None:
     dataframe = build_normalized_dataframe(
         device_serial_raw=None,
+        device_serial=None,
+        device_resolution_method="UNRESOLVED",
     )
 
     result = classify_normalized_dataframe(dataframe)
@@ -167,6 +171,20 @@ def test_missing_device_serial_is_rejected() -> None:
         ]
         == "MISSING_DEVICE_SERIAL"
     )
+
+
+def test_resolved_legacy_serial_is_not_rejected() -> None:
+    dataframe = build_normalized_dataframe(
+        device_serial_raw=None,
+        device_serial="202527000021P",
+        device_resolution_method=("LEGACY_IMEI"),
+    )
+
+    result = classify_normalized_dataframe(dataframe)
+
+    assert len(result.telemetry) == 1
+
+    assert result.rejected.empty
 
 
 def test_device_timestamp_has_priority() -> None:

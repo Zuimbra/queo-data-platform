@@ -25,6 +25,12 @@ from queo_data_platform.infrastructure.delta.table import (
 from queo_data_platform.silver.classification import (
     classify_normalized_dataframe,
 )
+from queo_data_platform.silver.identity_resolution import (
+    build_unambiguous_imei_to_serial_map,
+    build_unambiguous_imei_to_serial_map_from_identity_events,
+    merge_unambiguous_imei_to_serial_maps,
+    resolve_identity_dataframe,
+)
 from queo_data_platform.silver.incremental import (
     SilverAffectedPartitions,
     discover_affected_partitions,
@@ -119,22 +125,50 @@ def load_bronze_table(
     return DeltaTable(str(bronze_path))
 
 
+def delta_table_has_required_columns(
+    table_path: Path,
+    required_columns: list[str],
+) -> bool:
+    """
+    Verifica se uma Delta Table existe e contém todas
+    as colunas exigidas pelo contrato atual.
+    """
+
+    if not is_delta_table(table_path):
+        return False
+
+    table = DeltaTable(str(table_path))
+
+    available_columns = {field.name for field in table.schema().fields}
+
+    return set(required_columns).issubset(available_columns)
+
+
 def silver_supports_incremental_update(
     paths: SilverPaths,
 ) -> bool:
     """
-    Incrementalidade exige que os três produtos Silver
-    já existam como Delta Tables.
+    Incrementalidade exige os três produtos Silver
+    existentes e compatíveis com o contrato atual.
 
-    Se qualquer produto estiver ausente, fazemos um
-    rebuild completo para reconstruir um estado consistente.
+    Mudanças de schema provocam automaticamente
+    um FULL de recuperação/migração.
     """
 
     return all(
         (
-            is_delta_table(paths.telemetry),
-            is_delta_table(paths.identity),
-            is_delta_table(paths.rejected),
+            delta_table_has_required_columns(
+                paths.telemetry,
+                TELEMETRY_SCHEMA.names,
+            ),
+            delta_table_has_required_columns(
+                paths.identity,
+                DEVICE_IDENTITY_SCHEMA.names,
+            ),
+            delta_table_has_required_columns(
+                paths.rejected,
+                REJECTED_LOGS_SCHEMA.names,
+            ),
         )
     )
 
@@ -259,7 +293,8 @@ def load_silver_data(
     Com batch_ids que não existem na Bronze:
         retorna NOOP.
 
-    Com Silver incompleta ou inexistente:
+    Com Silver incompleta, inexistente ou incompatível
+    com o contrato atual:
         executa rebuild completo.
     """
 
@@ -320,7 +355,7 @@ def load_silver_data(
         if affected_partitions.is_empty:
             return SilverLoadResult(
                 mode="NOOP",
-                batch_ids=(normalized_batch_ids),
+                batch_ids=normalized_batch_ids,
                 affected_event_dates=(),
                 affected_rejection_dates=(),
                 telemetry_rows_written=0,
@@ -340,10 +375,38 @@ def load_silver_data(
     normalized = normalize_bronze_dataframe(bronze_scope)
 
     # --------------------------------------------------
+    # RESOLUÇÃO DE IDENTIDADE
+    # --------------------------------------------------
+
+    current_imei_to_serial = build_unambiguous_imei_to_serial_map(normalized)
+
+    if full_rebuild:
+        imei_to_serial = current_imei_to_serial
+
+    else:
+        identity_reference = DeltaTable(str(paths.identity)).to_pandas()
+
+        historical_imei_to_serial = (
+            build_unambiguous_imei_to_serial_map_from_identity_events(
+                identity_reference
+            )
+        )
+
+        imei_to_serial = merge_unambiguous_imei_to_serial_maps(
+            historical_imei_to_serial,
+            current_imei_to_serial,
+        )
+
+    resolved = resolve_identity_dataframe(
+        normalized,
+        imei_to_serial=imei_to_serial,
+    )
+
+    # --------------------------------------------------
     # CLASSIFICAÇÃO
     # --------------------------------------------------
 
-    classified = classify_normalized_dataframe(normalized)
+    classified = classify_normalized_dataframe(resolved)
 
     # --------------------------------------------------
     # PRODUTOS TIPADOS
@@ -370,7 +433,7 @@ def load_silver_data(
         identity=identity,
         rejected=rejected,
         full_rebuild=full_rebuild,
-        affected_partitions=(affected_partitions),
+        affected_partitions=affected_partitions,
     )
 
     # --------------------------------------------------
@@ -410,7 +473,7 @@ def load_silver_data(
     return SilverLoadResult(
         mode=mode,
         batch_ids=normalized_batch_ids,
-        affected_event_dates=(affected_event_dates),
+        affected_event_dates=affected_event_dates,
         affected_rejection_dates=(affected_rejection_dates),
         telemetry_rows_written=(telemetry_rows_written),
         identity_rows_written=(identity_rows_written),

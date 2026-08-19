@@ -49,6 +49,32 @@ def validate_identity_resolution_input(
         )
 
 
+def validate_identity_event_reference_input(
+    dataframe: pd.DataFrame,
+) -> None:
+    """
+    Confirma que um produto Silver de identidade possui
+    as evidências mínimas necessárias para servir como
+    referência histórica de IMEI -> serial.
+    """
+
+    required_columns = (
+        "device_serial_raw",
+        "imei",
+    )
+
+    missing_columns = [
+        column for column in required_columns if column not in dataframe.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "A referência histórica de identidade não possui "
+            "todas as colunas necessárias: "
+            f"{missing_columns}"
+        )
+
+
 def normalize_device_serial(
     device_serial_raw: object,
 ) -> str | None:
@@ -184,89 +210,6 @@ def build_unambiguous_imei_to_serial_map(
     }
 
 
-def build_unambiguous_legacy_file_imei_map(
-    dataframe: pd.DataFrame,
-) -> dict[str, str]:
-    """
-    Descobre o IMEI contextual de cada arquivo legado.
-
-    Um arquivo somente entra no mapa quando possui
-    exatamente um IMEI T1 válido distinto.
-    """
-
-    validate_identity_resolution_input(dataframe)
-
-    candidates: dict[
-        str,
-        set[str],
-    ] = {}
-
-    for record in dataframe.to_dict(orient="records"):
-        if record.get("protocol_version") != LEGACY_PROTOCOL_VERSION:
-            continue
-
-        if record.get("message_type") != "T1":
-            continue
-
-        if not has_valid_event_timestamp(record):
-            continue
-
-        source_file = record.get("source_file")
-
-        if not isinstance(
-            source_file,
-            str,
-        ):
-            continue
-
-        source_file = source_file.strip()
-
-        if not source_file:
-            continue
-
-        imei = normalize_imei(record.get("longitude_raw"))
-
-        if imei is None:
-            continue
-
-        candidates.setdefault(
-            source_file,
-            set(),
-        ).add(imei)
-
-    return {
-        source_file: next(iter(imeis))
-        for source_file, imeis in candidates.items()
-        if len(imeis) == 1
-    }
-
-
-def validate_identity_event_reference_input(
-    dataframe: pd.DataFrame,
-) -> None:
-    """
-    Confirma que um produto Silver de identidade possui
-    as evidências mínimas necessárias para servir como
-    referência histórica de IMEI -> serial.
-    """
-
-    required_columns = (
-        "device_serial_raw",
-        "imei",
-    )
-
-    missing_columns = [
-        column for column in required_columns if column not in dataframe.columns
-    ]
-
-    if missing_columns:
-        raise ValueError(
-            "A referência histórica de identidade não possui "
-            "todas as colunas necessárias: "
-            f"{missing_columns}"
-        )
-
-
 def build_unambiguous_imei_to_serial_map_from_identity_events(
     dataframe: pd.DataFrame,
 ) -> dict[str, str]:
@@ -351,6 +294,63 @@ def merge_unambiguous_imei_to_serial_maps(
         imei: next(iter(serials))
         for imei, serials in candidates.items()
         if len(serials) == 1
+    }
+
+
+def build_unambiguous_legacy_file_imei_map(
+    dataframe: pd.DataFrame,
+) -> dict[str, str]:
+    """
+    Descobre o IMEI contextual de cada arquivo legado.
+
+    Um arquivo somente entra no mapa quando possui
+    exatamente um IMEI T1 válido distinto.
+    """
+
+    validate_identity_resolution_input(dataframe)
+
+    candidates: dict[
+        str,
+        set[str],
+    ] = {}
+
+    for record in dataframe.to_dict(orient="records"):
+        if record.get("protocol_version") != LEGACY_PROTOCOL_VERSION:
+            continue
+
+        if record.get("message_type") != "T1":
+            continue
+
+        if not has_valid_event_timestamp(record):
+            continue
+
+        source_file = record.get("source_file")
+
+        if not isinstance(
+            source_file,
+            str,
+        ):
+            continue
+
+        source_file = source_file.strip()
+
+        if not source_file:
+            continue
+
+        imei = normalize_imei(record.get("longitude_raw"))
+
+        if imei is None:
+            continue
+
+        candidates.setdefault(
+            source_file,
+            set(),
+        ).add(imei)
+
+    return {
+        source_file: next(iter(imeis))
+        for source_file, imeis in candidates.items()
+        if len(imeis) == 1
     }
 
 
