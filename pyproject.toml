@@ -7,8 +7,10 @@ requires-python = ">=3.14"
 dependencies = [
     "deltalake>=1.6.2",
     "duckdb>=1.5.5",
+    "fastapi>=0.141.1",
     "pandas>=3.0.5",
     "pyarrow>=25.0.1",
+    "uvicorn>=0.52.4",
 ]
 
 [project.scripts]
@@ -16,6 +18,7 @@ queo-data-platform = "queo_data_platform.cli:main"
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pyright>=1.1.411",
     "pytest>=9.1.1",
     "ruff>=0.16.3",
