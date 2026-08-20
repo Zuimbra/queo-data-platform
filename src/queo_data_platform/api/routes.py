@@ -11,6 +11,10 @@ from queo_data_platform.api.dependencies import (
     QueryServiceDependency,
 )
 from queo_data_platform.api.models import (
+    DailySummaryPageResponse,
+    DailySummaryResponse,
+    DataQualitySummaryPageResponse,
+    DataQualitySummaryResponse,
     DevicePageResponse,
     DeviceResponse,
     HealthResponse,
@@ -43,6 +47,34 @@ OffsetParameter = Annotated[
         ge=0,
     ),
 ]
+
+
+def normalize_date_range(
+    start_date: date | None,
+    end_date: date | None,
+) -> tuple[
+    str | None,
+    str | None,
+]:
+    """
+    Valida e converte datas HTTP para o formato
+    esperado pela Query Layer.
+    """
+
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise HTTPException(
+            status_code=422,
+            detail=("start_date must be less than or equal to end_date."),
+        )
+
+    normalized_start_date = start_date.isoformat() if start_date is not None else None
+
+    normalized_end_date = end_date.isoformat() if end_date is not None else None
+
+    return (
+        normalized_start_date,
+        normalized_end_date,
+    )
 
 
 @router.get(
@@ -148,15 +180,13 @@ def list_route_points(
     limit: LimitParameter = DEFAULT_QUERY_LIMIT,
     offset: OffsetParameter = 0,
 ) -> RoutePageResponse:
-    normalized_start_date = start_date.isoformat() if start_date is not None else None
-
-    normalized_end_date = end_date.isoformat() if end_date is not None else None
-
-    if start_date is not None and end_date is not None and start_date > end_date:
-        raise HTTPException(
-            status_code=422,
-            detail=("start_date must be less than or equal to end_date."),
-        )
+    (
+        normalized_start_date,
+        normalized_end_date,
+    ) = normalize_date_range(
+        start_date,
+        end_date,
+    )
 
     page = service.page_route_points(
         device_serial,
@@ -172,6 +202,94 @@ def list_route_points(
     ]
 
     return RoutePageResponse(
+        items=items,
+        total=page.total,
+        limit=page.limit,
+        offset=page.offset,
+        returned=page.returned,
+        has_more=page.has_more,
+        next_offset=page.next_offset,
+    )
+
+
+@router.get(
+    "/api/v1/daily-summaries",
+    response_model=DailySummaryPageResponse,
+    tags=["analytics"],
+)
+def list_daily_summaries(
+    service: QueryServiceDependency,
+    device_serial: str | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    limit: LimitParameter = DEFAULT_QUERY_LIMIT,
+    offset: OffsetParameter = 0,
+) -> DailySummaryPageResponse:
+    (
+        normalized_start_date,
+        normalized_end_date,
+    ) = normalize_date_range(
+        start_date,
+        end_date,
+    )
+
+    page = service.page_daily_summaries(
+        device_serial=device_serial,
+        start_date=normalized_start_date,
+        end_date=normalized_end_date,
+        limit=limit,
+        offset=offset,
+    )
+
+    items = [
+        DailySummaryResponse.model_validate(record)
+        for record in dataframe_to_records(page.items)
+    ]
+
+    return DailySummaryPageResponse(
+        items=items,
+        total=page.total,
+        limit=page.limit,
+        offset=page.offset,
+        returned=page.returned,
+        has_more=page.has_more,
+        next_offset=page.next_offset,
+    )
+
+
+@router.get(
+    "/api/v1/data-quality",
+    response_model=(DataQualitySummaryPageResponse),
+    tags=["quality"],
+)
+def list_data_quality(
+    service: QueryServiceDependency,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    limit: LimitParameter = DEFAULT_QUERY_LIMIT,
+    offset: OffsetParameter = 0,
+) -> DataQualitySummaryPageResponse:
+    (
+        normalized_start_date,
+        normalized_end_date,
+    ) = normalize_date_range(
+        start_date,
+        end_date,
+    )
+
+    page = service.page_quality_summaries(
+        start_date=(normalized_start_date),
+        end_date=(normalized_end_date),
+        limit=limit,
+        offset=offset,
+    )
+
+    items = [
+        (DataQualitySummaryResponse.model_validate(record))
+        for record in dataframe_to_records(page.items)
+    ]
+
+    return DataQualitySummaryPageResponse(
         items=items,
         total=page.total,
         limit=page.limit,
