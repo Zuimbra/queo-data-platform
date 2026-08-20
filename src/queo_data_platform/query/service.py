@@ -37,6 +37,43 @@ class QueryPaths:
     quality_summary: Path
 
 
+@dataclass(frozen=True)
+class QueryPage:
+    """
+    Resultado paginado produzido pela Query Layer.
+
+    items:
+        registros da página atual.
+
+    total:
+        quantidade total de registros que atendem
+        aos mesmos filtros, antes de LIMIT/OFFSET.
+
+    limit / offset:
+        parâmetros efetivamente utilizados.
+    """
+
+    items: pd.DataFrame
+    total: int
+    limit: int
+    offset: int
+
+    @property
+    def returned(self) -> int:
+        return len(self.items)
+
+    @property
+    def has_more(self) -> bool:
+        return self.offset + self.returned < self.total
+
+    @property
+    def next_offset(self) -> int | None:
+        if not self.has_more:
+            return None
+
+        return self.offset + self.returned
+
+
 def get_query_paths(
     gold_dir: Path,
 ) -> QueryPaths:
@@ -199,6 +236,40 @@ def execute_gold_query(
 
     finally:
         connection.close()
+
+
+def execute_gold_count(
+    *,
+    table_path: Path,
+    relation_name: str,
+    sql: str,
+    parameters: list[object] | None = None,
+) -> int:
+    """
+    Executa uma consulta COUNT controlada sobre
+    uma tabela Gold.
+
+    O SQL recebido deve retornar uma coluna:
+
+        total_count
+    """
+
+    result = execute_gold_query(
+        table_path=table_path,
+        relation_name=relation_name,
+        sql=sql,
+        parameters=parameters,
+    )
+
+    if result.empty:
+        return 0
+
+    return int(
+        result.loc[
+            0,
+            "total_count",
+        ]
+    )
 
 
 @dataclass(frozen=True)
@@ -495,4 +566,541 @@ class QueryService:
                 OFFSET {normalized_offset}
             """,
             parameters=parameters,
+        )
+
+    def page_devices(
+        self,
+        *,
+        limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
+    ) -> QueryPage:
+        """
+        Retorna dispositivos junto dos metadados
+        necessários para paginação.
+        """
+
+        normalized_limit, normalized_offset = normalize_pagination(
+            limit=limit,
+            offset=offset,
+        )
+
+        items = self.list_devices(
+            limit=normalized_limit,
+            offset=normalized_offset,
+        )
+
+        total = execute_gold_count(
+            table_path=self.paths.dim_device,
+            relation_name=("query_dim_device"),
+            sql="""
+                SELECT
+                    COUNT(*) AS total_count
+
+                FROM query_dim_device
+            """,
+        )
+
+        return QueryPage(
+            items=items,
+            total=total,
+            limit=normalized_limit,
+            offset=normalized_offset,
+        )
+
+    def page_last_positions(
+        self,
+        *,
+        device_serial: str | None = None,
+        limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
+    ) -> QueryPage:
+        """
+        Retorna últimas posições com metadados
+        de paginação.
+        """
+
+        normalized_limit, normalized_offset = normalize_pagination(
+            limit=limit,
+            offset=offset,
+        )
+
+        items = self.list_last_positions(
+            device_serial=device_serial,
+            limit=normalized_limit,
+            offset=normalized_offset,
+        )
+
+        if device_serial is None:
+            total = execute_gold_count(
+                table_path=(self.paths.last_position),
+                relation_name=("query_last_position"),
+                sql="""
+                    SELECT
+                        COUNT(*) AS total_count
+
+                    FROM query_last_position
+                """,
+            )
+
+        else:
+            normalized_device_serial = normalize_required_text(
+                device_serial,
+                field_name=("device_serial"),
+            )
+
+            total = execute_gold_count(
+                table_path=(self.paths.last_position),
+                relation_name=("query_last_position"),
+                sql="""
+                    SELECT
+                        COUNT(*) AS total_count
+
+                    FROM query_last_position
+
+                    WHERE
+                        device_serial = ?
+                """,
+                parameters=[normalized_device_serial],
+            )
+
+        return QueryPage(
+            items=items,
+            total=total,
+            limit=normalized_limit,
+            offset=normalized_offset,
+        )
+
+    def page_route_points(
+        self,
+        device_serial: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
+    ) -> QueryPage:
+        """
+        Retorna uma página da rota e a quantidade
+        total de pontos que atendem aos filtros.
+        """
+
+        normalized_device_serial = normalize_required_text(
+            device_serial,
+            field_name="device_serial",
+        )
+
+        normalized_start_date = normalize_optional_date(
+            start_date,
+            field_name="start_date",
+        )
+
+        normalized_end_date = normalize_optional_date(
+            end_date,
+            field_name="end_date",
+        )
+
+        if (
+            normalized_start_date is not None
+            and normalized_end_date is not None
+            and normalized_start_date > normalized_end_date
+        ):
+            raise ValueError("start_date must be less than or equal to end_date.")
+
+        normalized_limit, normalized_offset = normalize_pagination(
+            limit=limit,
+            offset=offset,
+        )
+
+        items = self.list_route_points(
+            normalized_device_serial,
+            start_date=(normalized_start_date),
+            end_date=normalized_end_date,
+            limit=normalized_limit,
+            offset=normalized_offset,
+        )
+
+        filters = [
+            "device_serial = ?",
+        ]
+
+        parameters: list[object] = [
+            normalized_device_serial,
+        ]
+
+        if normalized_start_date is not None:
+            filters.append("event_date >= ?")
+            parameters.append(normalized_start_date)
+
+        if normalized_end_date is not None:
+            filters.append("event_date <= ?")
+            parameters.append(normalized_end_date)
+
+        where_clause = "\nAND ".join(filters)
+
+        total = execute_gold_count(
+            table_path=(self.paths.route_points),
+            relation_name=("query_route_points"),
+            sql=f"""
+                SELECT
+                    COUNT(*) AS total_count
+
+                FROM query_route_points
+
+                WHERE
+                    {where_clause}
+            """,
+            parameters=parameters,
+        )
+
+        return QueryPage(
+            items=items,
+            total=total,
+            limit=normalized_limit,
+            offset=normalized_offset,
+        )
+
+    def list_daily_summaries(
+        self,
+        *,
+        device_serial: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
+    ) -> pd.DataFrame:
+        """
+        Consulta os resumos operacionais diários
+        produzidos pela Gold.
+
+        Pode filtrar por:
+
+            device_serial
+            start_date
+            end_date
+        """
+
+        normalized_start_date = normalize_optional_date(
+            start_date,
+            field_name="start_date",
+        )
+
+        normalized_end_date = normalize_optional_date(
+            end_date,
+            field_name="end_date",
+        )
+
+        if (
+            normalized_start_date is not None
+            and normalized_end_date is not None
+            and normalized_start_date > normalized_end_date
+        ):
+            raise ValueError("start_date must be less than or equal to end_date.")
+
+        normalized_limit, normalized_offset = normalize_pagination(
+            limit=limit,
+            offset=offset,
+        )
+
+        filters: list[str] = []
+
+        parameters: list[object] = []
+
+        if device_serial is not None:
+            normalized_device_serial = normalize_required_text(
+                device_serial,
+                field_name=("device_serial"),
+            )
+
+            filters.append("device_serial = ?")
+
+            parameters.append(normalized_device_serial)
+
+        if normalized_start_date is not None:
+            filters.append("event_date >= ?")
+
+            parameters.append(normalized_start_date)
+
+        if normalized_end_date is not None:
+            filters.append("event_date <= ?")
+
+            parameters.append(normalized_end_date)
+
+        where_clause = "TRUE"
+
+        if filters:
+            where_clause = "\nAND ".join(filters)
+
+        return execute_gold_query(
+            table_path=(self.paths.daily_summary),
+            relation_name=("query_daily_summary"),
+            sql=f"""
+                SELECT
+                    *
+
+                FROM query_daily_summary
+
+                WHERE
+                    {where_clause}
+
+                ORDER BY
+                    event_date DESC,
+                    device_serial
+
+                LIMIT {normalized_limit}
+                OFFSET {normalized_offset}
+            """,
+            parameters=parameters,
+        )
+
+    def page_daily_summaries(
+        self,
+        *,
+        device_serial: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
+    ) -> QueryPage:
+        """
+        Retorna os resumos diários com metadados
+        completos de paginação.
+        """
+
+        normalized_start_date = normalize_optional_date(
+            start_date,
+            field_name="start_date",
+        )
+
+        normalized_end_date = normalize_optional_date(
+            end_date,
+            field_name="end_date",
+        )
+
+        if (
+            normalized_start_date is not None
+            and normalized_end_date is not None
+            and normalized_start_date > normalized_end_date
+        ):
+            raise ValueError("start_date must be less than or equal to end_date.")
+
+        normalized_limit, normalized_offset = normalize_pagination(
+            limit=limit,
+            offset=offset,
+        )
+
+        items = self.list_daily_summaries(
+            device_serial=device_serial,
+            start_date=(normalized_start_date),
+            end_date=normalized_end_date,
+            limit=normalized_limit,
+            offset=normalized_offset,
+        )
+
+        filters: list[str] = []
+
+        parameters: list[object] = []
+
+        if device_serial is not None:
+            normalized_device_serial = normalize_required_text(
+                device_serial,
+                field_name=("device_serial"),
+            )
+
+            filters.append("device_serial = ?")
+
+            parameters.append(normalized_device_serial)
+
+        if normalized_start_date is not None:
+            filters.append("event_date >= ?")
+
+            parameters.append(normalized_start_date)
+
+        if normalized_end_date is not None:
+            filters.append("event_date <= ?")
+
+            parameters.append(normalized_end_date)
+
+        where_clause = "TRUE"
+
+        if filters:
+            where_clause = "\nAND ".join(filters)
+
+        total = execute_gold_count(
+            table_path=(self.paths.daily_summary),
+            relation_name=("query_daily_summary"),
+            sql=f"""
+                SELECT
+                    COUNT(*) AS total_count
+
+                FROM query_daily_summary
+
+                WHERE
+                    {where_clause}
+            """,
+            parameters=parameters,
+        )
+
+        return QueryPage(
+            items=items,
+            total=total,
+            limit=normalized_limit,
+            offset=normalized_offset,
+        )
+
+    def list_quality_summaries(
+        self,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
+    ) -> pd.DataFrame:
+        """
+        Consulta as métricas diárias de qualidade
+        produzidas pela Gold.
+        """
+
+        normalized_start_date = normalize_optional_date(
+            start_date,
+            field_name="start_date",
+        )
+
+        normalized_end_date = normalize_optional_date(
+            end_date,
+            field_name="end_date",
+        )
+
+        if (
+            normalized_start_date is not None
+            and normalized_end_date is not None
+            and normalized_start_date > normalized_end_date
+        ):
+            raise ValueError("start_date must be less than or equal to end_date.")
+
+        normalized_limit, normalized_offset = normalize_pagination(
+            limit=limit,
+            offset=offset,
+        )
+
+        filters: list[str] = []
+
+        parameters: list[object] = []
+
+        if normalized_start_date is not None:
+            filters.append("metric_date >= ?")
+
+            parameters.append(normalized_start_date)
+
+        if normalized_end_date is not None:
+            filters.append("metric_date <= ?")
+
+            parameters.append(normalized_end_date)
+
+        where_clause = "TRUE"
+
+        if filters:
+            where_clause = "\nAND ".join(filters)
+
+        return execute_gold_query(
+            table_path=(self.paths.quality_summary),
+            relation_name=("query_quality_summary"),
+            sql=f"""
+                SELECT
+                    *
+
+                FROM query_quality_summary
+
+                WHERE
+                    {where_clause}
+
+                ORDER BY
+                    metric_date DESC
+
+                LIMIT {normalized_limit}
+                OFFSET {normalized_offset}
+            """,
+            parameters=parameters,
+        )
+
+    def page_quality_summaries(
+        self,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
+    ) -> QueryPage:
+        """
+        Retorna métricas de qualidade com
+        metadados de paginação.
+        """
+
+        normalized_start_date = normalize_optional_date(
+            start_date,
+            field_name="start_date",
+        )
+
+        normalized_end_date = normalize_optional_date(
+            end_date,
+            field_name="end_date",
+        )
+
+        if (
+            normalized_start_date is not None
+            and normalized_end_date is not None
+            and normalized_start_date > normalized_end_date
+        ):
+            raise ValueError("start_date must be less than or equal to end_date.")
+
+        normalized_limit, normalized_offset = normalize_pagination(
+            limit=limit,
+            offset=offset,
+        )
+
+        items = self.list_quality_summaries(
+            start_date=(normalized_start_date),
+            end_date=normalized_end_date,
+            limit=normalized_limit,
+            offset=normalized_offset,
+        )
+
+        filters: list[str] = []
+
+        parameters: list[object] = []
+
+        if normalized_start_date is not None:
+            filters.append("metric_date >= ?")
+
+            parameters.append(normalized_start_date)
+
+        if normalized_end_date is not None:
+            filters.append("metric_date <= ?")
+
+            parameters.append(normalized_end_date)
+
+        where_clause = "TRUE"
+
+        if filters:
+            where_clause = "\nAND ".join(filters)
+
+        total = execute_gold_count(
+            table_path=(self.paths.quality_summary),
+            relation_name=("query_quality_summary"),
+            sql=f"""
+                SELECT
+                    COUNT(*) AS total_count
+
+                FROM query_quality_summary
+
+                WHERE
+                    {where_clause}
+            """,
+            parameters=parameters,
+        )
+
+        return QueryPage(
+            items=items,
+            total=total,
+            limit=normalized_limit,
+            offset=normalized_offset,
         )
