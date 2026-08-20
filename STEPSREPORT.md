@@ -18987,3 +18987,3432 @@ com identidade sustentada por evidência inequívoca
 ```
 
 Esse é o ponto exato de retomada do desenvolvimento.
+
+---
+
+# 285. Revalidar a implementação cross-protocol antes do rebuild histórico
+
+## O que?
+
+Antes de executar novamente a Silver sobre o histórico real, foi feita uma nova validação técnica do refinamento:
+
+```text
+T1 de outra versão
+        ↓
+pode fornecer contexto IMEI por arquivo
+        ↓
+somente registros V14.06.111
+podem receber LEGACY_IMEI
+```
+
+Foram executados:
+
+```powershell
+uv run ruff check .
+uv run pyright
+uv run pytest tests/unit/test_silver_identity_resolution.py -v
+uv run pytest tests/integration/test_silver_service.py -v
+uv run pytest
+```
+
+Os resultados foram:
+
+```text
+Ruff
+All checks passed!
+
+Pyright
+0 errors
+0 warnings
+0 informations
+```
+
+Nos testes específicos:
+
+```text
+identity_resolution
+22 passed
+
+integration Silver
+10 passed
+```
+
+A suíte completa chegou a:
+
+```text
+191 passed
+```
+
+## Para que?
+
+O Passo 284 ainda tratava:
+
+```text
+MISSING_DEVICE_SERIAL
+242 → ~118
+```
+
+como hipótese.
+
+Antes de modificar novamente o estado persistido da Silver e da Gold, era necessário garantir que o refinamento estava protegido por testes e sem regressões estáticas.
+
+## Como?
+
+Os novos testes comprovaram quatro propriedades importantes:
+
+```text
+T1 de outra versão
+→ pode fornecer contexto
+```
+
+```text
+contexto cross-protocol
+→ pode resolver alvo V14.06.111
+```
+
+```text
+contexto cross-protocol
+→ NÃO torna V14.06.117 elegível
+```
+
+e:
+
+```text
+IMEI malformado
++
+IMEI válido no mesmo arquivo
+        ↓
+entrada malformada é ignorada
+entrada válida permanece utilizável
+```
+
+Com isso, o código estava pronto para ser validado sobre os dados históricos reais.
+
+---
+
+# 286. Executar rebuild FULL explícito da Silver
+
+## O que?
+
+Com os testes aprovados, foi executada explicitamente:
+
+```python
+load_silver(
+    settings,
+    batch_ids=None,
+)
+```
+
+A semântica já estabelecida anteriormente é:
+
+```text
+batch_ids=None
+        ↓
+FULL explícito
+```
+
+O resultado foi:
+
+```text
+SilverLoadResult(
+    mode='FULL',
+    batch_ids=(),
+    ...
+    telemetry_rows_written=67761,
+    identity_rows_written=966,
+    rejected_rows_written=19162
+)
+```
+
+## Para que?
+
+O refinamento cross-protocol alterava a interpretação de registros históricos já persistidos.
+
+Portanto:
+
+```text
+mudar somente o código
+```
+
+não seria suficiente.
+
+Era necessário:
+
+```text
+Bronze histórica
+        ↓
+reprocessar toda Silver
+        ↓
+aplicar nova resolução
+        ↓
+persistir novo estado
+```
+
+## Como?
+
+A Bronze não foi apagada nem reconstruída.
+
+Ela continuou sendo a fonte histórica imutável:
+
+```text
+Bronze existente
+        ↓
+Silver FULL
+```
+
+A reconstrução recalculou:
+
+```text
+telemetry_events
+device_identity_events
+rejected_logs
+```
+
+usando o resolver mais recente.
+
+---
+
+# 287. Reconstruir a Gold a partir da nova Silver
+
+## O que?
+
+Logo após o FULL da Silver, foi executado:
+
+```python
+load_gold(
+    settings,
+    silver_result=silver,
+)
+```
+
+O resultado foi:
+
+```text
+GoldLoadResult(
+    mode='FULL',
+    ...
+    affected_devices=(
+        '123456789',
+        '123456789012345',
+        '202527000021P',
+        '202527000022',
+    ),
+    dim_device_rows_written=4,
+    last_position_rows_written=3,
+    route_points_rows_written=14732,
+    daily_summary_rows_written=85,
+    quality_summary_rows_written=95
+)
+```
+
+## Para que?
+
+A Gold é derivada da Silver.
+
+Se registros anteriormente rejeitados passam a ser:
+
+```text
+telemetria válida
+```
+
+eles podem alterar:
+
+```text
+dim_device
+device_last_position
+device_route_points
+device_daily_summary
+data_quality_summary
+```
+
+Portanto, a reconstrução Silver precisava ser propagada aos produtos Gold.
+
+## Como?
+
+O fluxo executado foi:
+
+```text
+Bronze histórica
+        ↓
+Silver FULL
+        ↓
+nova classificação histórica
+        ↓
+Gold FULL
+        ↓
+produtos analíticos reconstruídos
+```
+
+---
+
+# 288. Confirmar empiricamente a hipótese `242 → 118`
+
+## O que?
+
+Depois do rebuild, foi consultada:
+
+```text
+data/lakehouse/02_silver/rejected_logs
+```
+
+O resultado total foi:
+
+```text
+TOTAL: 19162
+```
+
+Distribuído em:
+
+```text
+MISSING_MESSAGE_TYPE     18771
+INVALID_MESSAGE_TYPE       273
+MISSING_DEVICE_SERIAL      118
+```
+
+## Para que?
+
+No Passo 284 havia sido registrada apenas a hipótese:
+
+```text
+242
+→ aproximadamente 118
+```
+
+Agora o resultado real confirmou exatamente:
+
+```text
+MISSING_DEVICE_SERIAL
+242
+→
+118
+```
+
+## Como?
+
+A redução adicional foi:
+
+```text
+242 - 118 = 124
+```
+
+Portanto:
+
+```text
+124 registros adicionais
+```
+
+foram recuperados pelo refinamento que permite T1 cross-protocol como contexto de identidade.
+
+A hipótese investigativa foi, portanto, confirmada integralmente.
+
+---
+
+# 289. Identificar exatamente os 118 registros ainda sem serial
+
+## O que?
+
+Os:
+
+```text
+118
+```
+
+registros restantes foram agrupados por:
+
+```text
+protocol_version
+```
+
+O resultado foi:
+
+```text
+V14.06.117    108
+1               8
+V14.06.111      2
+```
+
+## Para que?
+
+A redução de rejeições não pode ser utilizada como objetivo isolado.
+
+Era necessário comprovar que o resolver parou exatamente nos casos para os quais não havia regra de identidade suficientemente sustentada.
+
+## Como?
+
+A distribuição por arquivo mostrou:
+
+```text
+logs_rastreador_2026-03-27.csv
+V14.06.117
+46
+```
+
+```text
+logs_rastreador_2026-04-08.csv
+V14.06.117
+34
+```
+
+```text
+logs_rastreador_2026-03-26.csv
+V14.06.117
+28
+```
+
+Também:
+
+```text
+logs_rastreador_2026-03-26.csv
+protocol_version = 1
+7
+```
+
+```text
+logs_rastreador_2026-02-26.csv
+protocol_version = 1
+1
+```
+
+e:
+
+```text
+logs_rastreador_2026-05-20.csv
+V14.06.111
+2
+```
+
+Assim:
+
+```text
+108 + 8 + 2 = 118
+```
+
+---
+
+# 290. Confirmar que `V14.06.117` continuou protegido contra inferência automática
+
+## O que?
+
+Foi executada uma consulta específica sobre:
+
+```text
+rejection_reason
+=
+MISSING_DEVICE_SERIAL
+```
+
+e:
+
+```text
+protocol_version
+=
+V14.06.117
+```
+
+Resultado:
+
+```text
+V14.06.117 ainda rejeitados: 108
+```
+
+Todos possuíam:
+
+```text
+device_resolution_method
+=
+UNRESOLVED
+```
+
+## Para que?
+
+Esse era o principal risco do refinamento cross-protocol.
+
+A nova regra deveria permitir:
+
+```text
+T1 V14.06.117
+→ evidência contextual
+```
+
+mas não:
+
+```text
+T2 V14.06.117
+→ inferência LEGACY_IMEI
+```
+
+## Como?
+
+A separação arquitetural permaneceu:
+
+```text
+build_unambiguous_legacy_file_imei_map()
+        ↓
+descobre evidência contextual
+```
+
+enquanto:
+
+```text
+resolve_identity_dataframe()
+        ↓
+decide elegibilidade do registro alvo
+```
+
+A elegibilidade continua restrita a:
+
+```text
+V14.06.111
+```
+
+O resultado real de:
+
+```text
+108 UNRESOLVED
+```
+
+confirmou essa proteção.
+
+---
+
+# 291. Confirmar que os 124 novos registros recuperados entraram como `LEGACY_IMEI`
+
+## O que?
+
+A tabela:
+
+```text
+telemetry_events
+```
+
+foi consultada novamente.
+
+O resultado passou a ser:
+
+```text
+TOTAL: 67761
+
+LEGACY_IMEI    54938
+DIRECT         12823
+```
+
+Antes do refinamento cross-protocol:
+
+```text
+LEGACY_IMEI
+54814
+```
+
+Depois:
+
+```text
+LEGACY_IMEI
+54938
+```
+
+## Para que?
+
+Era necessário confirmar que a redução:
+
+```text
+MISSING_DEVICE_SERIAL
+242 → 118
+```
+
+não ocorreu por uma mudança independente de classificação.
+
+## Como?
+
+A diferença foi:
+
+```text
+54938 - 54814
+=
+124
+```
+
+Exatamente a mesma quantidade removida de:
+
+```text
+MISSING_DEVICE_SERIAL
+```
+
+pois:
+
+```text
+242 - 118
+=
+124
+```
+
+Portanto:
+
+```text
+novos registros recuperados
+=
+novos registros LEGACY_IMEI na telemetria
+```
+
+A igualdade confirma a consistência da mudança.
+
+---
+
+# 292. Medir o impacto final do refinamento sobre a Gold
+
+## O que?
+
+Depois do rebuild, as cinco tabelas Gold apresentaram:
+
+```text
+dim_device:             4
+device_last_position:   3
+device_route_points:    14732
+device_daily_summary:   85
+data_quality_summary:   95
+```
+
+Antes do refinamento cross-protocol, o estado registrado era:
+
+```text
+dim_device:             4
+device_last_position:   3
+device_route_points:    14612
+device_daily_summary:   84
+data_quality_summary:   95
+```
+
+## Para que?
+
+Os:
+
+```text
+124
+```
+
+novos registros recuperados precisavam produzir efeitos coerentes nos produtos analíticos.
+
+## Como?
+
+As mudanças observadas foram:
+
+```text
+device_route_points
+14612
+→
+14732
+```
+
+diferença:
+
+```text
++120
+```
+
+e:
+
+```text
+device_daily_summary
+84
+→
+85
+```
+
+As demais tabelas permaneceram:
+
+```text
+dim_device
+4
+
+device_last_position
+3
+
+data_quality_summary
+95
+```
+
+Isso mostra que os novos registros afetaram principalmente:
+
+```text
+rota histórica
++
+agregação diária
+```
+
+sem criar artificialmente novos dispositivos ou alterar indevidamente a posição final.
+
+---
+
+# 293. Revalidar NOOP depois do segundo rebuild histórico
+
+## O que?
+
+O pipeline foi executado novamente sem novos arquivos:
+
+```powershell
+uv run queo-data-platform
+```
+
+Resultado:
+
+```text
+[BRONZE]
+discovered_files=0
+successful_files=0
+skipped_files=0
+failed_files=0
+inserted_rows=0
+duplicate_rows=0
+propagated_batches=0
+```
+
+Silver:
+
+```text
+mode=NOOP
+telemetry_rows=0
+identity_rows=0
+rejected_rows=0
+affected_event_dates=0
+affected_rejection_dates=0
+```
+
+Gold:
+
+```text
+mode=NOOP
+affected_devices=0
+dim_device_rows=0
+last_position_rows=0
+route_points_rows=0
+daily_summary_rows=0
+quality_summary_rows=0
+```
+
+Pipeline:
+
+```text
+has_new_data=False
+has_changes=False
+```
+
+## Para que?
+
+Era necessário garantir que o rebuild FULL havia ocorrido exclusivamente porque foi solicitado explicitamente para validar a nova semântica.
+
+Depois de persistido o novo estado:
+
+```text
+inbox vazio
+        ↓
+Bronze sem batches
+        ↓
+batch_ids=()
+        ↓
+Silver completa
+        ↓
+NOOP
+        ↓
+Gold NOOP
+```
+
+## Como?
+
+O resultado confirmou novamente a semântica:
+
+```text
+None
+→ FULL
+```
+
+```text
+()
++
+estado compatível
+→ NOOP
+```
+
+Assim, a resolução histórica não introduziu rebuilds repetitivos.
+
+---
+
+# 294. Encerrar a frente de resolução de identidade legada
+
+## O que?
+
+Com a validação final, a investigação iniciada sobre:
+
+```text
+V14.06.111
++
+serial ausente
+```
+
+foi considerada tecnicamente encerrada dentro do escopo definido.
+
+O resultado consolidado foi:
+
+```text
+MISSING_DEVICE_SERIAL
+
+55217
+↓
+242
+↓
+118
+```
+
+## Para que?
+
+O objetivo nunca foi transformar todos os registros históricos em registros válidos.
+
+O objetivo era:
+
+```text
+recuperar somente identidades
+sustentadas por evidência inequívoca
+```
+
+O estado final mantém:
+
+```text
+108 V14.06.117
+8 protocol_version = 1
+2 V14.06.111 sem contexto suficiente
+```
+
+como:
+
+```text
+UNRESOLVED
+```
+
+## Como?
+
+A estratégia final ficou:
+
+```text
+serial presente
+        ↓
+DIRECT
+```
+
+ou:
+
+```text
+V14.06.111 elegível
++
+timestamp válido
++
+Tn válido
++
+source_file normalizado
++
+T1 contextual com IMEI inequívoco
++
+IMEI → serial histórico inequívoco
+        ↓
+LEGACY_IMEI
+```
+
+caso contrário:
+
+```text
+UNRESOLVED
+```
+
+Com isso, a plataforma passou a preservar explicitamente:
+
+```text
+device_serial_raw
+device_serial
+device_resolution_method
+```
+
+e a frente de identity resolution deixou de bloquear o início da Query Layer.
+
+---
+
+# 295. Iniciar a Query Layer sobre a Gold
+
+## O que?
+
+Depois do fechamento da resolução histórica, foi inspecionado:
+
+```text
+src/queo_data_platform/query/
+```
+
+O diretório continha somente:
+
+```text
+__init__.py
+```
+
+vazio.
+
+Foi então iniciada a implementação real da Query Layer.
+
+## Para que?
+
+Até esse ponto, a arquitetura era:
+
+```text
+Raw
+ ↓
+Bronze
+ ↓
+Silver
+ ↓
+Gold
+```
+
+Os produtos Gold já existiam, mas não havia uma camada estável de consumo.
+
+Sem Query Layer, uma futura API poderia acabar fazendo:
+
+```text
+FastAPI
+  ↓
+DeltaTable
+```
+
+ou:
+
+```text
+FastAPI
+  ↓
+DuckDB SQL
+```
+
+diretamente.
+
+Isso duplicaria responsabilidade e acoplaria transporte HTTP à persistência.
+
+## Como?
+
+Foi adotada a arquitetura:
+
+```text
+Gold Delta Tables
+        ↓
+Query Layer
+        ↓
+REST API
+        ↓
+MCP
+```
+
+A Query Layer passa a ser a única camada responsável por consultas sobre os produtos Gold.
+
+---
+
+# 296. Criar `QueryPaths` e resolver os produtos Gold
+
+## O que?
+
+Foi criado:
+
+```text
+src/queo_data_platform/query/service.py
+```
+
+com:
+
+```python
+@dataclass(frozen=True)
+class QueryPaths:
+    dim_device: Path
+    last_position: Path
+    route_points: Path
+    daily_summary: Path
+    quality_summary: Path
+```
+
+Também foi criada:
+
+```python
+get_query_paths(...)
+```
+
+## Para que?
+
+O restante da camada de consulta não deve repetir manualmente:
+
+```text
+gold_dir / "dim_device"
+gold_dir / "device_last_position"
+...
+```
+
+## Como?
+
+O serviço recebe apenas:
+
+```python
+gold_dir
+```
+
+e resolve os cinco produtos:
+
+```text
+dim_device
+device_last_position
+device_route_points
+device_daily_summary
+data_quality_summary
+```
+
+Essa abstração centraliza a topologia física da Gold.
+
+---
+
+# 297. Criar validações reutilizáveis da Query Layer
+
+## O que?
+
+Foram adicionadas funções para normalizar parâmetros de consulta:
+
+```python
+normalize_required_text(...)
+normalize_pagination(...)
+normalize_optional_date(...)
+```
+
+## Para que?
+
+A API futura não deveria duplicar regras como:
+
+```text
+device_serial vazio
+limit inválido
+offset negativo
+data fora de YYYY-MM-DD
+intervalo de datas inválido
+```
+
+Essas regras pertencem à fronteira de consulta.
+
+## Como?
+
+Para paginação foi definido:
+
+```text
+DEFAULT_QUERY_LIMIT = 100
+MAX_QUERY_LIMIT = 1000
+```
+
+Regras:
+
+```text
+limit
+1..1000
+```
+
+```text
+offset
+>= 0
+```
+
+Tipos incorretos geram:
+
+```text
+TypeError
+```
+
+Valores semanticamente inválidos geram:
+
+```text
+ValueError
+```
+
+---
+
+# 298. Criar carregamento read-only das Delta Tables Gold
+
+## O que?
+
+Foi criada:
+
+```python
+load_query_table(...)
+```
+
+## Para que?
+
+A Query Layer deve consumir produtos já publicados.
+
+Ela não deve:
+
+```text
+criar tabela
+corrigir tabela
+reconstruir Gold
+```
+
+## Como?
+
+Antes da consulta:
+
+```python
+is_delta_table(...)
+```
+
+valida a existência física.
+
+Se a Gold necessária não existir:
+
+```python
+FileNotFoundError
+```
+
+é levantado.
+
+O comportamento é deliberadamente:
+
+```text
+Gold ausente
+→ falha explícita de leitura
+```
+
+e não:
+
+```text
+Gold ausente
+→ criar estado silenciosamente
+```
+
+---
+
+# 299. Executar consultas Gold por DuckDB sobre PyArrow Dataset
+
+## O que?
+
+Foi criada:
+
+```python
+execute_gold_query(...)
+```
+
+## Para que?
+
+A camada precisava executar filtros, ordenações e paginação sem carregar toda a lógica para Pandas.
+
+## Como?
+
+O fluxo implementado foi:
+
+```text
+DeltaTable
+    ↓
+to_pyarrow_dataset()
+    ↓
+DuckDB register()
+    ↓
+SQL controlado
+    ↓
+Pandas DataFrame
+```
+
+Cada operação abre:
+
+```python
+duckdb.connect()
+```
+
+e fecha a conexão em:
+
+```python
+finally
+```
+
+O SQL não é fornecido pelo consumidor externo.
+
+Ele permanece definido internamente pela Query Layer.
+
+---
+
+# 300. Criar `QueryService`
+
+## O que?
+
+Foi criada:
+
+```python
+@dataclass(frozen=True)
+class QueryService:
+    gold_dir: Path
+```
+
+com:
+
+```python
+QueryService.from_settings(...)
+```
+
+## Para que?
+
+Criar uma única interface reutilizável por:
+
+```text
+REST API
+MCP
+testes
+outros consumidores internos
+```
+
+## Como?
+
+A dependência passou a ser:
+
+```text
+consumidor
+    ↓
+QueryService
+    ↓
+QueryPaths
+    ↓
+Gold
+```
+
+O consumidor não precisa conhecer:
+
+```text
+DeltaTable
+DuckDB
+PyArrow Dataset
+path físico da Gold
+```
+
+---
+
+# 301. Implementar consultas de dispositivos e última posição
+
+## O que?
+
+Foram implementados:
+
+```python
+list_devices(...)
+get_device(...)
+list_last_positions(...)
+get_last_position(...)
+```
+
+## Para que?
+
+Esses métodos respondem às primeiras consultas operacionais necessárias para consumo externo:
+
+```text
+quais dispositivos existem?
+```
+
+```text
+qual é o estado de um dispositivo?
+```
+
+```text
+qual foi sua última posição?
+```
+
+## Como?
+
+`list_devices()` utiliza:
+
+```sql
+ORDER BY device_serial
+```
+
+para garantir paginação determinística.
+
+`get_device()` utiliza:
+
+```sql
+WHERE device_serial = ?
+LIMIT 1
+```
+
+A última posição utiliza o produto Gold:
+
+```text
+device_last_position
+```
+
+em vez de recalcular a posição a partir da Silver.
+
+---
+
+# 302. Implementar consulta de rota com filtros de partição
+
+## O que?
+
+Foi criado:
+
+```python
+list_route_points(...)
+```
+
+aceitando:
+
+```text
+device_serial
+start_date
+end_date
+limit
+offset
+```
+
+## Para que?
+
+A tabela:
+
+```text
+device_route_points
+```
+
+é particionada por:
+
+```text
+event_date
+```
+
+Portanto, filtros temporais devem ser expressos usando essa coluna sempre que possível.
+
+## Como?
+
+A consulta constrói filtros como:
+
+```sql
+device_serial = ?
+AND event_date >= ?
+AND event_date <= ?
+```
+
+e ordena por:
+
+```text
+event_timestamp
+point_sequence
+```
+
+Assim:
+
+```text
+rota
+→ ordem cronológica determinística
+```
+
+e os filtros estão alinhados ao particionamento físico da Gold.
+
+---
+
+# 303. Testar a primeira versão da Query Layer
+
+## O que?
+
+Foi criado:
+
+```text
+tests/unit/test_query_service.py
+```
+
+com dez testes.
+
+Eles cobrem:
+
+```text
+listagem ordenada de dispositivos
+paginação
+busca exata de dispositivo
+dispositivo inexistente
+filtro de última posição
+última posição específica
+filtro temporal de rota
+ordenação da rota
+paginação da rota
+validação de parâmetros
+Gold ausente
+```
+
+## Para que?
+
+Era necessário proteger a Query Layer antes que HTTP ou MCP passassem a depender dela.
+
+## Como?
+
+Os testes utilizam Delta Tables reais em diretórios temporários:
+
+```text
+tmp_path
+   ↓
+Gold temporária
+   ↓
+QueryService
+   ↓
+DuckDB
+   ↓
+assert
+```
+
+A primeira execução dos dez testes confirmou:
+
+```text
+10 passed
+```
+
+---
+
+# 304. Corrigir qualidade estática da primeira Query Layer
+
+## O que?
+
+Durante a implementação inicial, o Ruff identificou ajustes como:
+
+```text
+I001
+TRY004
+UP037
+DTZ001
+```
+
+Também, durante uma edição intermediária, a função:
+
+```python
+normalize_required_text(...)
+```
+
+foi removida acidentalmente.
+
+Isso provocou:
+
+```text
+NameError
+```
+
+em sete testes.
+
+## Para que?
+
+Esses problemas precisavam ser corrigidos antes de versionar a nova camada.
+
+## Como?
+
+Foram feitos os seguintes ajustes:
+
+```text
+imports ordenados
+```
+
+```text
+TypeError para tipos inválidos
+```
+
+```text
+annotations modernas sem string desnecessária
+```
+
+```text
+datetime de testes com UTC explícito
+```
+
+e:
+
+```python
+normalize_required_text(...)
+```
+
+foi restaurada.
+
+Depois disso, a implementação voltou ao comportamento esperado e pôde ser versionada.
+
+---
+
+# 305. Versionar a primeira Query Layer
+
+## O que?
+
+A implementação inicial foi publicada no commit:
+
+```text
+9717eff
+feat: add Gold query service
+```
+
+## Para que?
+
+Criar um ponto de versionamento independente antes de ampliar a Query Layer para todos os produtos Gold.
+
+## Como?
+
+O commit incluiu principalmente:
+
+```text
+src/queo_data_platform/query/__init__.py
+src/queo_data_platform/query/service.py
+tests/unit/test_query_service.py
+```
+
+Nesse ponto a Query Layer já oferecia:
+
+```text
+devices
+last positions
+route points
+```
+
+mas ainda faltavam:
+
+```text
+daily summary
+data quality
+metadados completos de paginação
+```
+
+---
+
+# 306. Criar `QueryPage`
+
+## O que?
+
+Foi criada:
+
+```python
+@dataclass(frozen=True)
+class QueryPage:
+    items: pd.DataFrame
+    total: int
+    limit: int
+    offset: int
+```
+
+Com propriedades:
+
+```python
+returned
+has_more
+next_offset
+```
+
+## Para que?
+
+Um simples:
+
+```text
+DataFrame
+```
+
+não contém informação suficiente para uma API paginada.
+
+O consumidor precisa saber:
+
+```text
+quantos registros existem no total?
+quantos vieram nesta página?
+existe próxima página?
+qual o próximo offset?
+```
+
+## Como?
+
+A Query Layer passou a representar uma página como:
+
+```text
+items
+total
+limit
+offset
+returned
+has_more
+next_offset
+```
+
+sem alterar os métodos antigos que ainda devolvem diretamente:
+
+```text
+DataFrame
+```
+
+Isso preservou retrocompatibilidade.
+
+---
+
+# 307. Criar consultas de contagem para paginação
+
+## O que?
+
+Foi criada:
+
+```python
+execute_gold_count(...)
+```
+
+## Para que?
+
+Para produzir:
+
+```text
+total
+```
+
+é necessário executar:
+
+```sql
+COUNT(*)
+```
+
+com os mesmos filtros da consulta paginada, mas sem:
+
+```text
+LIMIT
+OFFSET
+```
+
+## Como?
+
+O helper reutiliza:
+
+```python
+execute_gold_query(...)
+```
+
+e espera uma coluna:
+
+```text
+total_count
+```
+
+O resultado é convertido para:
+
+```python
+int
+```
+
+e utilizado por `QueryPage`.
+
+---
+
+# 308. Adicionar versões paginadas das consultas existentes
+
+## O que?
+
+Foram implementados:
+
+```python
+page_devices(...)
+page_last_positions(...)
+page_route_points(...)
+```
+
+## Para que?
+
+Manter simultaneamente:
+
+```text
+API simples de DataFrame
+```
+
+e:
+
+```text
+API pronta para HTTP paginado
+```
+
+## Como?
+
+Cada método:
+
+```text
+normaliza parâmetros
+        ↓
+executa consulta de items
+        ↓
+executa COUNT com mesmos filtros
+        ↓
+constrói QueryPage
+```
+
+A API HTTP pode então apenas serializar o resultado.
+
+---
+
+# 309. Expor `device_daily_summary` pela Query Layer
+
+## O que?
+
+Foram adicionados:
+
+```python
+list_daily_summaries(...)
+page_daily_summaries(...)
+```
+
+com filtros:
+
+```text
+device_serial
+start_date
+end_date
+limit
+offset
+```
+
+## Para que?
+
+A Gold já possuía:
+
+```text
+device_daily_summary
+```
+
+mas ainda não existia uma interface de consumo.
+
+## Como?
+
+A consulta utiliza:
+
+```text
+event_date
+```
+
+para os filtros temporais.
+
+A ordenação é:
+
+```text
+event_date DESC
+device_serial
+```
+
+O método paginado utiliza os mesmos filtros para calcular:
+
+```text
+COUNT(*)
+```
+
+---
+
+# 310. Expor `data_quality_summary` pela Query Layer
+
+## O que?
+
+Foram adicionados:
+
+```python
+list_quality_summaries(...)
+page_quality_summaries(...)
+```
+
+## Para que?
+
+Completar o acesso de consulta aos cinco produtos Gold.
+
+## Como?
+
+Os filtros temporais utilizam:
+
+```text
+metric_date
+```
+
+e a ordenação é:
+
+```text
+metric_date DESC
+```
+
+Com isso, a Query Layer passou a cobrir:
+
+```text
+dim_device
+device_last_position
+device_route_points
+device_daily_summary
+data_quality_summary
+```
+
+---
+
+# 311. Adicionar testes da Query Layer expandida
+
+## O que?
+
+Foi criado:
+
+```text
+tests/unit/test_query_summary_service.py
+```
+
+com oito novos testes.
+
+## Para que?
+
+Proteger:
+
+```text
+QueryPage
+COUNT
+daily summary
+data quality
+filtros
+paginação
+intervalos de data
+```
+
+## Como?
+
+Os testes verificam cenários como:
+
+```text
+total de página
+has_more
+next_offset
+última página
+daily summary por dispositivo/data
+quality por data
+COUNT com filtro
+rota paginada
+intervalo invertido
+```
+
+A suíte passou posteriormente a conter:
+
+```text
+10 testes
+test_query_service.py
+```
+
+e:
+
+```text
+8 testes
+test_query_summary_service.py
+```
+
+totalizando:
+
+```text
+18 testes unitários
+```
+
+dedicados à Query Layer.
+
+---
+
+# 312. Versionar a Query Layer completa
+
+## O que?
+
+A expansão foi publicada no commit:
+
+```text
+d23002a
+feat: extend Gold query service
+```
+
+## Para que?
+
+Encerrar a fundação de consulta antes da introdução da camada HTTP.
+
+## Como?
+
+Depois desse commit:
+
+```text
+Gold
+        ↓
+QueryService
+        ├── devices
+        ├── last positions
+        ├── route points
+        ├── daily summaries
+        └── data quality
+```
+
+Todos os produtos Gold já possuíam uma interface read-only reutilizável.
+
+---
+
+# 313. Iniciar a REST API sobre a Query Layer
+
+## O que?
+
+Foi iniciada:
+
+```text
+src/queo_data_platform/api/
+```
+
+Até então o diretório possuía apenas:
+
+```text
+__init__.py
+```
+
+vazio.
+
+Foram adicionadas as dependências:
+
+```text
+fastapi
+uvicorn
+```
+
+e, para testes:
+
+```text
+httpx
+```
+
+## Para que?
+
+Expor os produtos Gold por HTTP sem permitir:
+
+```text
+rota FastAPI
+→ DeltaTable
+```
+
+ou:
+
+```text
+rota FastAPI
+→ DuckDB
+```
+
+## Como?
+
+A arquitetura escolhida foi:
+
+```text
+Gold
+ ↓
+QueryService
+ ↓
+FastAPI
+ ↓
+HTTP
+```
+
+Assim, toda regra de consulta continua concentrada em:
+
+```text
+query/
+```
+
+---
+
+# 314. Criar modelos HTTP com Pydantic
+
+## O que?
+
+Foi criado:
+
+```text
+src/queo_data_platform/api/models.py
+```
+
+com modelos como:
+
+```text
+HealthResponse
+PageMetadata
+DeviceResponse
+DevicePageResponse
+LastPositionResponse
+RoutePointResponse
+RoutePageResponse
+```
+
+## Para que?
+
+Um contrato:
+
+```text
+PyArrow / DataFrame
+```
+
+não deve ser automaticamente considerado um contrato HTTP.
+
+A API precisa definir explicitamente sua própria representação externa.
+
+## Como?
+
+O fluxo passou a ser:
+
+```text
+Gold schema
+     ↓
+QueryService
+     ↓
+DataFrame
+     ↓
+Pydantic model
+     ↓
+JSON
+```
+
+A API passa a controlar:
+
+```text
+tipos
+campos opcionais
+estrutura de paginação
+serialização
+```
+
+---
+
+# 315. Criar serialização segura de DataFrame para JSON
+
+## O que?
+
+Foi criado:
+
+```text
+src/queo_data_platform/api/serialization.py
+```
+
+com:
+
+```python
+dataframe_to_records(...)
+```
+
+## Para que?
+
+Pandas pode representar valores ausentes como:
+
+```text
+NaN
+NaT
+```
+
+Esses valores não são contratos JSON adequados.
+
+## Como?
+
+Antes da conversão:
+
+```text
+NaN / NaT
+        ↓
+None
+        ↓
+Pydantic
+        ↓
+null em JSON
+```
+
+Assim, detalhes internos do Pandas não vazam para o contrato HTTP.
+
+---
+
+# 316. Criar dependency injection da Query Layer
+
+## O que?
+
+Foi criado:
+
+```text
+src/queo_data_platform/api/dependencies.py
+```
+
+com:
+
+```python
+get_query_service()
+```
+
+e:
+
+```python
+QueryServiceDependency
+```
+
+## Para que?
+
+As rotas não devem construir manualmente:
+
+```text
+Settings
+gold_dir
+QueryService
+```
+
+## Como?
+
+FastAPI passa a resolver:
+
+```text
+request
+  ↓
+Depends
+  ↓
+get_query_service()
+  ↓
+load_settings()
+  ↓
+QueryService.from_settings()
+```
+
+Nos testes essa dependência pode ser sobrescrita por um `QueryService` apontando para uma Gold temporária.
+
+---
+
+# 317. Criar a factory da aplicação FastAPI
+
+## O que?
+
+Foi criado:
+
+```text
+src/queo_data_platform/api/app.py
+```
+
+com:
+
+```python
+create_app()
+```
+
+e:
+
+```python
+app = create_app()
+```
+
+## Para que?
+
+A factory permite criar aplicações independentes em:
+
+```text
+produção
+testes
+```
+
+sem compartilhar estado indevido.
+
+## Como?
+
+A aplicação é configurada com:
+
+```text
+title
+version
+description
+router
+exception handlers
+```
+
+e pode ser executada por:
+
+```powershell
+uv run uvicorn queo_data_platform.api.app:app --reload
+```
+
+---
+
+# 318. Implementar tratamento HTTP para Gold ausente e parâmetros inválidos
+
+## O que?
+
+Foram adicionados handlers para:
+
+```text
+FileNotFoundError
+ValueError
+```
+
+## Para que?
+
+A Query Layer conhece erros de domínio técnico.
+
+A API precisa traduzi-los para semântica HTTP.
+
+## Como?
+
+Gold ausente:
+
+```text
+FileNotFoundError
+        ↓
+503 Service Unavailable
+```
+
+Resposta:
+
+```json
+{
+    "detail": "Gold data is not available."
+}
+```
+
+O caminho físico do Lakehouse não é exposto.
+
+Valores semanticamente inválidos:
+
+```text
+ValueError
+        ↓
+422
+```
+
+---
+
+# 319. Criar os primeiros endpoints REST
+
+## O que?
+
+Foram implementados:
+
+```text
+GET /health
+```
+
+```text
+GET /api/v1/devices
+```
+
+```text
+GET /api/v1/devices/{device_serial}
+```
+
+```text
+GET /api/v1/devices/{device_serial}/last-position
+```
+
+```text
+GET /api/v1/devices/{device_serial}/route
+```
+
+## Para que?
+
+Criar a primeira superfície HTTP read-only da plataforma.
+
+## Como?
+
+As rotas apenas:
+
+```text
+recebem parâmetros HTTP
+        ↓
+chamam QueryService
+        ↓
+convertem DataFrame
+        ↓
+validam Pydantic
+        ↓
+retornam JSON
+```
+
+Não existe acesso direto da rota a:
+
+```text
+Delta
+DuckDB
+Silver
+Bronze
+```
+
+---
+
+# 320. Adicionar paginação e validação HTTP aos endpoints
+
+## O que?
+
+Foram definidos parâmetros de:
+
+```text
+limit
+offset
+```
+
+com limites compatíveis com a Query Layer.
+
+Também foram utilizados:
+
+```text
+start_date
+end_date
+```
+
+na rota de histórico.
+
+## Para que?
+
+Impedir respostas ilimitadas e fornecer uma interface previsível para consumidores externos.
+
+## Como?
+
+A API utiliza:
+
+```text
+limit >= 1
+limit <= 1000
+offset >= 0
+```
+
+e devolve:
+
+```text
+items
+total
+limit
+offset
+returned
+has_more
+next_offset
+```
+
+Os parâmetros HTTP são validados antes da execução da consulta.
+
+---
+
+# 321. Criar testes HTTP da primeira API
+
+## O que?
+
+Foi criado:
+
+```text
+tests/api/test_app.py
+```
+
+com sete testes.
+
+Eles cobrem:
+
+```text
+health sem Gold
+lista paginada de dispositivos
+404 para dispositivo inexistente
+última posição
+rota paginada
+intervalo de data invertido
+503 quando Gold está ausente
+```
+
+## Para que?
+
+Validar a camada HTTP de ponta a ponta sem depender do Lakehouse real.
+
+## Como?
+
+Cada teste pode criar:
+
+```text
+Gold temporária
+        ↓
+QueryService temporário
+        ↓
+dependency override
+        ↓
+TestClient
+        ↓
+rota HTTP real
+```
+
+O resultado observado foi:
+
+```text
+7 passed
+```
+
+A suíte completa nesse ponto chegou a:
+
+```text
+216 passed
+```
+
+---
+
+# 322. Identificar warning de compatibilidade do `TestClient`
+
+## O que?
+
+Durante os testes HTTP apareceu:
+
+```text
+StarletteDeprecationWarning:
+Using `httpx` with `starlette.testclient`
+is deprecated;
+install `httpx2` instead.
+```
+
+## Para que?
+
+Registrar que:
+
+```text
+testes passaram
+```
+
+mas existe uma migração de dependência pendente no ambiente de testes HTTP.
+
+## Como?
+
+O warning não bloqueou:
+
+```text
+7 testes API
+```
+
+nem:
+
+```text
+216 testes totais
+```
+
+Por isso ele não foi misturado à implementação funcional da API naquele momento.
+
+A correção ficou reservada para um bloco operacional posterior.
+
+---
+
+# 323. Validar inicialização real pelo Uvicorn
+
+## O que?
+
+Foi executado:
+
+```powershell
+uv run uvicorn queo_data_platform.api.app:app --reload
+```
+
+O servidor iniciou com sucesso:
+
+```text
+Uvicorn running on http://127.0.0.1:8000
+```
+
+e:
+
+```text
+Application startup complete.
+```
+
+Depois foi encerrado normalmente.
+
+## Para que?
+
+Os testes com `TestClient` validam a aplicação dentro do processo de testes.
+
+Também era necessário provar que o módulo:
+
+```text
+queo_data_platform.api.app:app
+```
+
+podia ser carregado pelo servidor ASGI real.
+
+## Como?
+
+O fluxo validado foi:
+
+```text
+Uvicorn
+   ↓
+import app
+   ↓
+create_app()
+   ↓
+FastAPI startup
+```
+
+sem erros de importação ou configuração.
+
+---
+
+# 324. Versionar a primeira REST API
+
+## O que?
+
+A implementação foi publicada no commit:
+
+```text
+e040175
+feat: add initial REST API
+```
+
+## Para que?
+
+Criar um ponto estável com:
+
+```text
+Query Layer
++
+REST API inicial
+```
+
+antes de adicionar os dois produtos Gold restantes à superfície HTTP.
+
+## Como?
+
+O commit adicionou:
+
+```text
+FastAPI
+Uvicorn
+dependência HTTP de testes
+```
+
+e os módulos:
+
+```text
+api/app.py
+api/dependencies.py
+api/models.py
+api/routes.py
+api/serialization.py
+```
+
+além dos testes HTTP.
+
+---
+
+# 325. Expandir os modelos HTTP para analytics e qualidade
+
+## O que?
+
+Foram adicionados modelos Pydantic para:
+
+```text
+device_daily_summary
+```
+
+e:
+
+```text
+data_quality_summary
+```
+
+Entre eles:
+
+```text
+DailySummaryResponse
+DailySummaryPageResponse
+DataQualitySummaryResponse
+DataQualitySummaryPageResponse
+```
+
+## Para que?
+
+Os dois produtos já existiam na Query Layer, mas ainda não possuíam contrato HTTP.
+
+## Como?
+
+Os modelos refletem os campos Gold relevantes, incluindo métricas como:
+
+```text
+message_count
+valid_position_percentage
+maximum_speed
+battery metrics
+odometer metrics
+```
+
+e, para qualidade:
+
+```text
+telemetry_event_count
+identity_event_count
+accepted_event_count
+rejected_event_count
+rejection_percentage
+motivos de rejeição
+```
+
+---
+
+# 326. Centralizar a validação de intervalos de data da API
+
+## O que?
+
+Foi criada:
+
+```python
+normalize_date_range(...)
+```
+
+em:
+
+```text
+api/routes.py
+```
+
+## Para que?
+
+A mesma regra passou a ser necessária em:
+
+```text
+route
+daily summaries
+data quality
+```
+
+Duplicar a validação em cada endpoint aumentaria risco de inconsistência.
+
+## Como?
+
+A função verifica:
+
+```text
+start_date <= end_date
+```
+
+e converte:
+
+```python
+date
+```
+
+para:
+
+```text
+YYYY-MM-DD
+```
+
+antes de chamar a Query Layer.
+
+---
+
+# 327. Expor `device_daily_summary` por HTTP
+
+## O que?
+
+Foi criado:
+
+```text
+GET /api/v1/daily-summaries
+```
+
+Filtros:
+
+```text
+device_serial
+start_date
+end_date
+limit
+offset
+```
+
+## Para que?
+
+Disponibilizar via REST o produto:
+
+```text
+device_daily_summary
+```
+
+já persistido na Gold e exposto pela Query Layer.
+
+## Como?
+
+A rota chama:
+
+```python
+page_daily_summaries(...)
+```
+
+e devolve:
+
+```text
+items
+total
+limit
+offset
+returned
+has_more
+next_offset
+```
+
+A transformação analítica continua exclusivamente na Gold.
+
+---
+
+# 328. Expor `data_quality_summary` por HTTP
+
+## O que?
+
+Foi criado:
+
+```text
+GET /api/v1/data-quality
+```
+
+Filtros:
+
+```text
+start_date
+end_date
+limit
+offset
+```
+
+## Para que?
+
+Disponibilizar métricas operacionais de qualidade sem exigir que o consumidor consulte diretamente a Delta Table.
+
+## Como?
+
+A rota chama:
+
+```python
+page_quality_summaries(...)
+```
+
+e serializa os resultados pelos modelos Pydantic da API.
+
+Com isso, os cinco produtos Gold passaram a possuir superfície de consulta pela arquitetura:
+
+```text
+Gold
+ ↓
+Query Layer
+ ↓
+REST API
+```
+
+---
+
+# 329. Adicionar configuração de CORS por ambiente
+
+## O que?
+
+`Settings` foi expandido com:
+
+```python
+api_cors_origins
+```
+
+e foi criada:
+
+```python
+parse_csv_environment_variable(...)
+```
+
+A variável utilizada é:
+
+```text
+QUEO_API_CORS_ORIGINS
+```
+
+## Para que?
+
+Permitir que aplicações web autorizadas consumam a API sem codificar origens dentro do código.
+
+## Como?
+
+Exemplo:
+
+```text
+QUEO_API_CORS_ORIGINS=
+http://localhost:5173,https://app.example.com
+```
+
+é normalizado para:
+
+```python
+(
+    "http://localhost:5173",
+    "https://app.example.com",
+)
+```
+
+Valores vazios são ignorados e duplicatas são removidas preservando a ordem.
+
+---
+
+# 330. Manter CORS fechado por padrão
+
+## O que?
+
+Foi adotada a semântica:
+
+```python
+api_cors_origins: tuple[str, ...] = ()
+```
+
+## Para que?
+
+Evitar que a introdução da API altere comportamento de:
+
+```text
+Bronze
+Silver
+Gold
+Pipeline
+```
+
+e evitar liberar origens HTTP implicitamente.
+
+## Como?
+
+Se:
+
+```text
+QUEO_API_CORS_ORIGINS
+```
+
+não existir:
+
+```text
+api_cors_origins = ()
+```
+
+e nenhum `CORSMiddleware` precisa autorizar origens externas.
+
+Se a variável existir:
+
+```text
+somente origens explicitamente listadas
+```
+
+são configuradas.
+
+---
+
+# 331. Adicionar `CORSMiddleware` condicional
+
+## O que?
+
+`create_app()` passou a receber opcionalmente:
+
+```python
+settings: Settings | None
+```
+
+e configurar:
+
+```python
+CORSMiddleware
+```
+
+somente quando:
+
+```python
+resolved_settings.api_cors_origins
+```
+
+não está vazio.
+
+## Para que?
+
+Tornar a aplicação configurável e testável sem depender diretamente do ambiente global em todos os cenários.
+
+## Como?
+
+A política configurada permite:
+
+```text
+origens explicitamente listadas
+GET
+headers necessários
+```
+
+e mantém:
+
+```text
+allow_credentials=False
+```
+
+O comportamento padrão permanece conservador.
+
+---
+
+# 332. Criar testes de configuração da API
+
+## O que?
+
+Foi criado:
+
+```text
+tests/unit/test_api_settings.py
+```
+
+com testes para:
+
+```text
+CORS vazio por padrão
+```
+
+e:
+
+```text
+parsing de múltiplas origens por ambiente
+```
+
+## Para que?
+
+A configuração de ambiente passou a fazer parte do contrato operacional da plataforma.
+
+Ela precisava ser protegida independentemente dos testes HTTP.
+
+## Como?
+
+Os testes utilizam:
+
+```python
+monkeypatch
+```
+
+para controlar:
+
+```text
+QUEO_API_CORS_ORIGINS
+```
+
+Os dois testes passaram:
+
+```text
+2 passed
+```
+
+---
+
+# 333. Criar testes HTTP de summaries, quality e CORS
+
+## O que?
+
+Foi criado:
+
+```text
+tests/api/test_summary_routes.py
+```
+
+com quatro novos testes.
+
+Eles cobrem:
+
+```text
+daily summary filtrado
+data quality filtrado
+intervalos de data invertidos
+CORS para origem configurada
+```
+
+## Para que?
+
+Completar a proteção da superfície HTTP adicionada no segundo bloco da API.
+
+## Como?
+
+O resultado foi:
+
+```text
+4 passed
+```
+
+Os sete testes da API inicial também continuaram:
+
+```text
+7 passed
+```
+
+Assim, os testes HTTP específicos disponíveis nesse ponto eram:
+
+```text
+11 testes
+```
+
+além dos:
+
+```text
+2 testes
+```
+
+de configuração de CORS.
+
+---
+
+# 334. Detectar regressão de compatibilidade ao adicionar `api_cors_origins`
+
+## O que?
+
+Na primeira versão da mudança, `Settings` foi definido como:
+
+```python
+api_cors_origins: tuple[str, ...]
+```
+
+sem valor padrão.
+
+O Pyright detectou:
+
+```text
+2 errors
+```
+
+em construções manuais de `Settings`.
+
+A suíte completa coletou:
+
+```text
+222 items
+```
+
+mas terminou com:
+
+```text
+217 passed
+5 failed
+```
+
+## Para que?
+
+Os testes de:
+
+```text
+Gold
+Pipeline
+```
+
+criam `Settings(...)` manualmente.
+
+Obrigá-los a conhecer uma configuração exclusiva da API criaria acoplamento indevido.
+
+## Como?
+
+As falhas eram todas:
+
+```text
+Settings.__init__()
+missing required positional argument:
+'api_cors_origins'
+```
+
+Isso mostrou que:
+
+```text
+configuração HTTP opcional
+```
+
+havia sido transformada acidentalmente em:
+
+```text
+dependência obrigatória de toda a plataforma
+```
+
+---
+
+# 335. Tornar `api_cors_origins` retrocompatível
+
+## O que?
+
+A definição foi corrigida para:
+
+```python
+api_cors_origins: tuple[str, ...] = ()
+```
+
+## Para que?
+
+Preservar a semântica:
+
+```text
+Settings criado manualmente
+        ↓
+CORS = ()
+```
+
+enquanto:
+
+```text
+load_settings()
+        ↓
+lê QUEO_API_CORS_ORIGINS
+```
+
+## Como?
+
+Com o valor padrão:
+
+```text
+Bronze
+Silver
+Gold
+Pipeline
+```
+
+não precisam conhecer configuração HTTP.
+
+Somente a aplicação FastAPI consome:
+
+```text
+api_cors_origins
+```
+
+quando necessário.
+
+Essa decisão mantém a configuração de CORS opcional e evita alterar contratos internos que não pertencem à API.
+
+---
+
+# 336. Versionar a REST API completa de leitura
+
+## O que?
+
+O segundo bloco da API foi publicado no commit:
+
+```text
+de8c720
+feat: complete REST API read endpoints
+```
+
+## Para que?
+
+Encerrar a implementação funcional da superfície REST de leitura sobre os produtos Gold.
+
+## Como?
+
+O commit consolidou:
+
+```text
+daily summaries
+data quality
+normalização de intervalos
+CORS por ambiente
+Settings retrocompatível
+testes de CORS
+testes dos novos endpoints
+```
+
+Depois desse ponto, a API possui acesso read-only a todos os cinco produtos Gold por meio exclusivo da Query Layer.
+
+---
+
+# 337. Estado atual da arquitetura de consumo
+
+## O que?
+
+O projeto chegou ao seguinte estado:
+
+```text
+                         QUEO DATA PLATFORM
+
+Raw
+ │
+ ▼
+Bronze                                      ✅
+ │
+ ▼
+Silver                                      ✅
+ │
+ ├── normalization
+ ├── identity resolution
+ ├── classification
+ ├── transformation
+ ├── FULL
+ ├── INCREMENTAL
+ └── NOOP
+ │
+ ▼
+Gold                                        ✅
+ │
+ ├── dim_device
+ ├── device_last_position
+ ├── device_route_points
+ ├── device_daily_summary
+ └── data_quality_summary
+ │
+ ▼
+Query Layer                                 ✅
+ │
+ ├── Delta read validation
+ ├── DuckDB
+ ├── filters
+ ├── pagination
+ ├── COUNT
+ └── QueryPage
+ │
+ ▼
+REST API                                    ✅ funcional
+ │
+ ├── /health
+ ├── /api/v1/devices
+ ├── /api/v1/devices/{device_serial}
+ ├── /api/v1/devices/{device_serial}/last-position
+ ├── /api/v1/devices/{device_serial}/route
+ ├── /api/v1/daily-summaries
+ └── /api/v1/data-quality
+ │
+ ▼
+MCP                                         ⏳
+```
+
+## Para que?
+
+Registrar que a arquitetura de leitura deixou de ser apenas planejada.
+
+Agora existe efetivamente:
+
+```text
+Gold
+ ↓
+Query Layer
+ ↓
+REST API
+```
+
+## Como?
+
+A responsabilidade está separada da seguinte forma:
+
+```text
+Gold
+→ transformação e produtos analíticos
+```
+
+```text
+Query Layer
+→ acesso, filtros, ordenação, paginação e contagem
+```
+
+```text
+REST API
+→ HTTP, Pydantic, status codes e serialização
+```
+
+A regra arquitetural consolidada é:
+
+```text
+API
+NÃO acessa Delta diretamente
+```
+
+e:
+
+```text
+API
+NÃO contém SQL DuckDB
+```
+
+---
+
+# 338. Estado atual da qualidade automatizada
+
+## O que?
+
+Durante a evolução recente foram observados os seguintes marcos:
+
+```text
+após cross-protocol identity resolution
+191 passed
+```
+
+Depois da primeira REST API:
+
+```text
+216 passed
+1 warning
+```
+
+Depois da inclusão de summaries, quality e CORS:
+
+```text
+222 testes coletados
+```
+
+Na primeira execução completa dessa última mudança:
+
+```text
+217 passed
+5 failed
+```
+
+As cinco falhas foram diagnosticadas exclusivamente como consequência de:
+
+```text
+api_cors_origins
+```
+
+ter sido inicialmente obrigatório em `Settings`.
+
+Essa incompatibilidade foi corrigida antes do commit final:
+
+```text
+de8c720
+```
+
+## Para que?
+
+Preservar no histórico a diferença entre:
+
+```text
+falha funcional da nova API
+```
+
+e:
+
+```text
+regressão de compatibilidade de configuração
+```
+
+Os testes específicos dos novos componentes haviam passado:
+
+```text
+test_api_settings
+2 passed
+```
+
+```text
+test_app
+7 passed
+```
+
+```text
+test_summary_routes
+4 passed
+```
+
+## Como?
+
+A correção não alterou lógica de:
+
+```text
+Bronze
+Silver
+Gold
+Pipeline
+```
+
+Apenas restaurou:
+
+```python
+Settings(...)
+```
+
+como uma construção válida mesmo quando nenhuma configuração de CORS é informada.
+
+---
+
+# 339. Registrar warning operacional ainda pendente no ambiente HTTP
+
+## O que?
+
+Os testes FastAPI continuam tendo registrado o warning:
+
+```text
+StarletteDeprecationWarning:
+Using `httpx` with `starlette.testclient`
+is deprecated;
+install `httpx2` instead.
+```
+
+## Para que?
+
+Esse warning não representa falha funcional da REST API, mas precisa ser resolvido antes de considerar o setup HTTP completamente encerrado.
+
+## Como?
+
+No estado atualmente publicado, o grupo de desenvolvimento ainda utiliza:
+
+```text
+httpx
+```
+
+O próximo bloco deverá tratar essa migração separadamente, sem misturá-la à implementação funcional dos endpoints.
+
+Até este ponto:
+
+```text
+migração para httpx2
+NÃO executada
+```
+
+e:
+
+```text
+documentação operacional completa da API
+NÃO criada
+```
+
+Esses itens permanecem como trabalho futuro.
+
+---
+
+# 340. Próximo ponto exato de retomada
+
+## O que?
+
+O desenvolvimento foi interrompido deliberadamente para atualizar esta documentação.
+
+O próximo trabalho não é modificar novamente:
+
+```text
+Bronze
+Silver
+Gold
+Query Layer
+```
+
+A próxima frente imediata é o fechamento operacional da REST API.
+
+## Para que?
+
+A implementação funcional já está publicada.
+
+Antes de iniciar MCP, ainda é recomendável eliminar a pendência de ambiente de testes HTTP e registrar formalmente como executar e configurar a API.
+
+## Como?
+
+A sequência de retomada é:
+
+```text
+1. migrar dependência de testes
+   httpx → httpx2
+        ↓
+2. executar testes HTTP
+        ↓
+3. confirmar remoção do
+   StarletteDeprecationWarning
+        ↓
+4. executar Ruff
+        ↓
+5. executar Pyright
+        ↓
+6. executar suíte completa
+        ↓
+7. documentar execução da REST API
+        ↓
+8. documentar:
+   QUEO_DATA_DIR
+   QUEO_API_CORS_ORIGINS
+   paginação
+   endpoints
+   códigos HTTP
+        ↓
+9. versionar fechamento operacional da API
+        ↓
+10. iniciar MCP
+```
+
+Depois disso, o MCP deverá seguir a mesma arquitetura já consolidada:
+
+```text
+Gold
+        ↓
+QueryService
+        ├────────────→ REST API
+        │
+        └────────────→ MCP
+```
+
+e não:
+
+```text
+MCP
+ ↓
+Delta diretamente
+```
+
+nem:
+
+```text
+MCP
+ ↓
+nova implementação paralela de SQL
+```
+
+A Query Layer deve continuar sendo a fonte única de acesso read-only aos produtos Gold.
+
+Esse é o ponto exato de retomada do desenvolvimento.
