@@ -15770,3 +15770,3220 @@ A Silver passará a utilizar contexto de identidade somente quando a associaçã
 
 Esse é o ponto exato para retomada do desenvolvimento.
 
+---
+
+# 240. Criar o módulo isolado de resolução de identidade da Silver
+
+## O que?
+
+Foi criado:
+
+```text
+src/
+└── queo_data_platform/
+    └── silver/
+        └── identity_resolution.py
+```
+
+O módulo foi criado antes de alterar a classificação ou transformação da Silver.
+
+Ele passou a concentrar a lógica responsável por interpretar situações em que:
+
+```text
+device_serial_raw
+```
+
+não está presente no registro, mas existe evidência suficiente para descobrir com segurança a identidade do dispositivo.
+
+## Para que?
+
+O diagnóstico dos dados históricos mostrou que milhares de mensagens válidas do protocolo:
+
+```text
+V14.06.111
+```
+
+não possuíam serial explícito.
+
+Essas mensagens eram classificadas como:
+
+```text
+MISSING_DEVICE_SERIAL
+```
+
+apesar de pertencerem a dispositivos que podiam ser identificados através de registros T1 e IMEI.
+
+A lógica não deveria ser adicionada diretamente a:
+
+```text
+classification.py
+```
+
+porque classificação e resolução de identidade possuem responsabilidades diferentes.
+
+A arquitetura passou a seguir:
+
+```text
+normalization
+      ↓
+identity resolution
+      ↓
+classification
+      ↓
+transformation
+```
+
+## Como?
+
+O novo módulo começou definindo explicitamente as estratégias possíveis:
+
+```python
+IdentityResolutionMethod = Literal[
+    "DIRECT",
+    "LEGACY_IMEI",
+    "UNRESOLVED",
+]
+```
+
+Assim, um registro pode possuir identidade:
+
+```text
+DIRECT
+```
+
+quando o serial veio diretamente da origem;
+
+```text
+LEGACY_IMEI
+```
+
+quando o serial foi reconstruído a partir de evidência histórica;
+
+ou:
+
+```text
+UNRESOLVED
+```
+
+quando não há informação suficiente para realizar associação segura.
+
+---
+
+# 241. Criar normalizações próprias para serial e IMEI
+
+## O que?
+
+Foram adicionadas funções específicas para interpretar os identificadores usados durante a resolução.
+
+Para serial:
+
+```python
+def normalize_device_serial(
+    device_serial_raw: object,
+) -> str | None:
+```
+
+Para IMEI:
+
+```python
+def normalize_imei(
+    imei_raw: object,
+) -> str | None:
+```
+
+## Para que?
+
+Os dois campos possuem regras diferentes.
+
+O serial recebido pode aparecer como:
+
+```text
+M202527000021P
+```
+
+enquanto a identidade operacional deve ser:
+
+```text
+202527000021P
+```
+
+O IMEI, por outro lado, só deve participar da resolução automática quando possuir exatamente:
+
+```text
+15 dígitos
+```
+
+## Como?
+
+A normalização do serial remove espaços e um eventual prefixo:
+
+```text
+M
+```
+
+Exemplo:
+
+```text
+M202527000021P
+        ↓
+202527000021P
+```
+
+Sem modificar:
+
+```text
+device_serial_raw
+```
+
+Já o IMEI é validado através de:
+
+```python
+IMEI_PATTERN = re.compile(
+    r"^[0-9]{15}$"
+)
+```
+
+Assim:
+
+```text
+354173560222769
+→ válido
+```
+
+mas:
+
+```text
+354173560222769]
+→ inválido
+```
+
+Esse comportamento se mostrou importante posteriormente durante a investigação dos arquivos históricos.
+
+---
+
+# 242. Formalizar a validação de timestamp para resolução histórica
+
+## O que?
+
+Foram criadas:
+
+```python
+has_valid_timestamp(...)
+```
+
+e:
+
+```python
+has_valid_event_timestamp(...)
+```
+
+## Para que?
+
+A resolução de identidade não deve transformar uma linha sem contexto temporal utilizável em dado operacional válido.
+
+A regra acompanha o fallback já usado pela Silver:
+
+```text
+device_timestamp
+        ↓
+se ausente
+        ↓
+server_timestamp
+```
+
+## Como?
+
+Conceitualmente:
+
+```python
+device_timestamp válido
+OR
+server_timestamp válido
+```
+
+permite que a linha participe da resolução.
+
+Quando os dois são inválidos:
+
+```text
+não existe event_timestamp utilizável
+        ↓
+não resolver identidade
+```
+
+---
+
+# 243. Construir mapa inequívoco `IMEI → device_serial`
+
+## O que?
+
+Foi criada:
+
+```python
+build_unambiguous_imei_to_serial_map(...)
+```
+
+A função percorre mensagens:
+
+```text
+T1
+```
+
+que possuem simultaneamente:
+
+```text
+serial direto
++
+IMEI válido
++
+timestamp válido
+```
+
+e produz relações:
+
+```text
+IMEI
+  ↓
+device_serial
+```
+
+## Para que?
+
+Os dados modernos permitem descobrir relações confiáveis entre os dois identificadores.
+
+Um exemplo real encontrado durante a investigação foi:
+
+```text
+354173560222769
+        ↓
+202527000021P
+```
+
+Essa relação pode ser usada para interpretar mensagens históricas anteriores em que o serial não estava explicitamente presente.
+
+## Como?
+
+Cada IMEI acumula os seriais observados.
+
+Conceitualmente:
+
+```text
+IMEI A
+├── serial X
+└── serial X
+```
+
+continua sendo:
+
+```text
+IMEI A
+→ serial X
+```
+
+Porém:
+
+```text
+IMEI A
+├── serial X
+└── serial Y
+```
+
+é considerado ambíguo.
+
+Nesse caso:
+
+```text
+relação descartada
+```
+
+A plataforma prefere manter um registro rejeitado a atribuir um dispositivo incorreto.
+
+---
+
+# 244. Construir contexto de identidade por `source_file`
+
+## O que?
+
+Foi criada:
+
+```python
+build_unambiguous_legacy_file_imei_map(...)
+```
+
+Inicialmente, a função procurava mensagens:
+
+```text
+T1
++
+V14.06.111
++
+timestamp válido
++
+IMEI válido
+```
+
+dentro de cada:
+
+```text
+source_file
+```
+
+e produzia:
+
+```text
+source_file
+        ↓
+IMEI
+```
+
+## Para que?
+
+As mensagens históricas sem serial não carregavam necessariamente o IMEI em cada linha.
+
+Entretanto, o mesmo arquivo podia conter uma mensagem T1 capaz de identificar o equipamento.
+
+Assim:
+
+```text
+source_file
+    ↓
+T1
+    ↓
+IMEI
+    ↓
+serial conhecido
+```
+
+fornece um contexto de identidade para outras mensagens válidas daquele arquivo.
+
+## Como?
+
+O arquivo somente entra no mapa quando possui exatamente:
+
+```text
+1 IMEI válido distinto
+```
+
+Por exemplo:
+
+```text
+arquivo.csv
+├── T1 → 354173560222769
+├── T1 → 354173560222769
+└── T1 → 354173560222769
+```
+
+produz:
+
+```text
+arquivo.csv
+→ 354173560222769
+```
+
+Por outro lado:
+
+```text
+arquivo.csv
+├── T1 → IMEI A
+└── T1 → IMEI B
+```
+
+não produz associação automática.
+
+---
+
+# 245. Implementar as três estratégias de resolução
+
+## O que?
+
+Foi implementada:
+
+```python
+resolve_identity_dataframe(...)
+```
+
+A função adiciona duas colunas ao DataFrame normalizado:
+
+```text
+device_serial
+device_resolution_method
+```
+
+sem alterar:
+
+```text
+device_serial_raw
+```
+
+## Para que?
+
+A Silver precisava diferenciar:
+
+```text
+o que veio da origem
+```
+
+de:
+
+```text
+o que a plataforma conseguiu interpretar
+```
+
+## Como?
+
+A primeira estratégia é:
+
+```text
+DIRECT
+```
+
+Se existe:
+
+```text
+device_serial_raw
+```
+
+ele é normalizado e utilizado diretamente.
+
+Exemplo:
+
+```text
+device_serial_raw
+= M202527000021P
+
+        ↓
+
+device_serial
+= 202527000021P
+
+device_resolution_method
+= DIRECT
+```
+
+A segunda estratégia é:
+
+```text
+LEGACY_IMEI
+```
+
+Ela exige:
+
+```text
+serial bruto ausente
++
+protocol_version permitida
++
+message_type T<n>
++
+timestamp válido
++
+source_file com IMEI inequívoco
++
+IMEI associado a serial inequívoco
+```
+
+produzindo:
+
+```text
+device_serial_raw
+= NULL
+
+device_serial
+= 202527000021P
+
+device_resolution_method
+= LEGACY_IMEI
+```
+
+Quando qualquer evidência necessária está ausente:
+
+```text
+device_serial
+= NULL
+
+device_resolution_method
+= UNRESOLVED
+```
+
+---
+
+# 246. Impedir tráfego externo de herdar identidade do arquivo
+
+## O que?
+
+A resolução histórica passou a exigir que:
+
+```text
+message_type
+```
+
+continue seguindo o formato:
+
+```regex
+^T[0-9]+$
+```
+
+## Para que?
+
+Os arquivos históricos continham mistura de:
+
+```text
+tracker
+HTTP
+MQTT
+PING
+RTSP
+scanner
+payloads aleatórios
+```
+
+Um arquivo possuir identidade conhecida não significa que qualquer linha dele seja telemetria do dispositivo.
+
+## Como?
+
+Antes de aplicar:
+
+```text
+LEGACY_IMEI
+```
+
+a linha precisa continuar parecendo uma mensagem real do protocolo.
+
+Portanto:
+
+```text
+T2
+T3
+T14
+T27
+...
+```
+
+podem participar.
+
+Enquanto:
+
+```text
+GET / HTTP/1.1
+PING
+MQTT
+RTSP
+```
+
+continuam sem identidade resolvida e posteriormente permanecem em:
+
+```text
+rejected_logs
+```
+
+---
+
+# 247. Criar testes unitários do resolver antes da integração
+
+## O que?
+
+Foi criado:
+
+```text
+tests/unit/test_silver_identity_resolution.py
+```
+
+Os primeiros testes cobriram cenários como:
+
+```text
+serial direto
+normalização do prefixo M
+IMEI válido
+IMEI ambíguo
+arquivo com um IMEI
+arquivo com múltiplos IMEIs
+resolução LEGACY_IMEI
+tráfego externo
+timestamp ausente
+IMEI desconhecido
+```
+
+## Para que?
+
+A resolução histórica teria capacidade de reclassificar dezenas de milhares de registros.
+
+Por isso, ela foi testada isoladamente antes de alterar o comportamento da Silver inteira.
+
+## Como?
+
+Entre os cenários protegidos:
+
+```text
+IMEI único
++
+serial único
+→ resolve
+```
+
+```text
+IMEI único
++
+dois seriais
+→ não resolve
+```
+
+```text
+arquivo
++
+dois IMEIs válidos
+→ não resolve
+```
+
+```text
+GET / HTTP/1.1
++
+arquivo identificado
+→ continua UNRESOLVED
+```
+
+```text
+timestamp ausente
+→ continua UNRESOLVED
+```
+
+---
+
+# 248. Identificar um problema da resolução no modo incremental
+
+## O que?
+
+Antes de integrar o resolver ao serviço Silver, foi identificado um problema adicional.
+
+No modo:
+
+```text
+FULL
+```
+
+o resolver poderia observar toda a Bronze e encontrar relações como:
+
+```text
+IMEI
+→ serial
+```
+
+Porém, em:
+
+```text
+INCREMENTAL
+```
+
+a Silver trabalha apenas com o escopo das partições afetadas.
+
+A mensagem T1 moderna que comprova:
+
+```text
+IMEI → serial
+```
+
+pode estar em uma partição histórica fora do escopo atual.
+
+## Para que?
+
+Sem corrigir isso, a mesma linha poderia ser:
+
+```text
+resolvida em FULL
+```
+
+mas:
+
+```text
+UNRESOLVED em INCREMENTAL
+```
+
+dependendo das datas carregadas naquela execução.
+
+Isso produziria comportamento não determinístico entre os modos da Silver.
+
+---
+
+# 249. Usar `device_identity_events` como referência histórica incremental
+
+## O que?
+
+Foi criada:
+
+```python
+build_unambiguous_imei_to_serial_map_from_identity_events(...)
+```
+
+Ela permite reconstruir relações:
+
+```text
+IMEI
+→ serial
+```
+
+utilizando o produto Silver já persistido:
+
+```text
+device_identity_events
+```
+
+## Para que?
+
+Durante um processamento incremental, a partição atual pode não conter a T1 moderna necessária para descobrir a identidade.
+
+Entretanto, a Silver já pode possuir essa evidência em seu histórico.
+
+## Como?
+
+A função utiliza apenas:
+
+```text
+device_serial_raw
++
+imei
+```
+
+das identidades persistidas.
+
+Uma decisão importante foi:
+
+```text
+device_serial inferido
+NÃO serve como nova evidência
+```
+
+Somente identidade originalmente direta pode ensinar:
+
+```text
+IMEI → serial
+```
+
+Isso impede propagação circular.
+
+Exemplo proibido:
+
+```text
+linha A foi inferida
+        ↓
+linha A ensina identidade para B
+        ↓
+B ensina identidade para C
+```
+
+A cadeia de evidência sempre precisa retornar a um identificador recebido diretamente da origem.
+
+---
+
+# 250. Combinar evidência atual e histórica de forma conservadora
+
+## O que?
+
+Foi criada:
+
+```python
+merge_unambiguous_imei_to_serial_maps(...)
+```
+
+Ela combina:
+
+```text
+mapa histórico
++
+mapa descoberto no escopo atual
+```
+
+## Para que?
+
+O modo incremental precisa usar tanto:
+
+```text
+evidência já persistida
+```
+
+quanto:
+
+```text
+evidência nova
+```
+
+sem permitir que divergências sejam escondidas.
+
+## Como?
+
+Se ambas as fontes dizem:
+
+```text
+354173560222769
+→ 202527000021P
+```
+
+a associação permanece.
+
+Se ocorrer:
+
+```text
+histórico
+354173560222769
+→ serial A
+
+atual
+354173560222769
+→ serial B
+```
+
+a associação é descartada.
+
+Portanto:
+
+```text
+conflito
+→ não resolver
+```
+
+---
+
+# 251. Normalizar `source_file` também no momento da consulta
+
+## O que?
+
+Foi corrigida a leitura de:
+
+```text
+source_file
+```
+
+dentro de:
+
+```python
+resolve_identity_dataframe(...)
+```
+
+## Para que?
+
+O mapa contextual já normalizava o nome do arquivo usando:
+
+```python
+strip()
+```
+
+mas a consulta posterior utilizava inicialmente o valor bruto.
+
+Isso poderia produzir:
+
+```text
+"arquivo.csv"
+```
+
+no mapa e:
+
+```text
+" arquivo.csv "
+```
+
+na linha consultada.
+
+Mesmo representando o mesmo arquivo, a associação falharia.
+
+## Como?
+
+O valor passou a ser normalizado antes da busca:
+
+```text
+source_file_raw
+        ↓
+strip()
+        ↓
+source_file
+        ↓
+legacy_file_imei.get(source_file)
+```
+
+Também foi criado teste específico para esse comportamento.
+
+---
+
+# 252. Integrar resolução de identidade ao fluxo real da Silver
+
+## O que?
+
+O serviço:
+
+```text
+src/queo_data_platform/silver/service.py
+```
+
+passou a executar a resolução imediatamente depois da normalização.
+
+O fluxo tornou-se:
+
+```text
+Bronze
+  ↓
+normalize_bronze_dataframe
+  ↓
+build IMEI → serial
+  ↓
+resolve_identity_dataframe
+  ↓
+classify_normalized_dataframe
+  ↓
+transform
+  ↓
+persist Silver
+```
+
+## Para que?
+
+Até esse momento:
+
+```text
+identity_resolution.py
+```
+
+existia isoladamente.
+
+Para que a nova semântica tivesse efeito real, a classificação precisava receber:
+
+```text
+device_serial
+```
+
+já resolvido.
+
+## Como?
+
+Depois de:
+
+```python
+normalized = normalize_bronze_dataframe(
+    bronze_scope
+)
+```
+
+é construído:
+
+```text
+current_imei_to_serial
+```
+
+No modo FULL:
+
+```text
+mapa atual
+→ utilizado diretamente
+```
+
+No modo INCREMENTAL:
+
+```text
+device_identity_events histórica
+        ↓
+historical_imei_to_serial
+
++
+
+escopo atual
+        ↓
+current_imei_to_serial
+
+        ↓
+merge conservador
+        ↓
+imei_to_serial
+```
+
+Depois:
+
+```python
+resolved = resolve_identity_dataframe(
+    normalized,
+    imei_to_serial=imei_to_serial,
+)
+```
+
+e somente então:
+
+```python
+classified = classify_normalized_dataframe(
+    resolved
+)
+```
+
+---
+
+# 253. Alterar a classificação para usar identidade canônica
+
+## O que?
+
+Em:
+
+```text
+src/queo_data_platform/silver/classification.py
+```
+
+a regra de rejeição mudou de:
+
+```sql
+WHEN device_serial_raw IS NULL
+THEN 'MISSING_DEVICE_SERIAL'
+```
+
+para:
+
+```sql
+WHEN device_serial IS NULL
+THEN 'MISSING_DEVICE_SERIAL'
+```
+
+## Para que?
+
+Antes:
+
+```text
+serial ausente na origem
+→ rejeição
+```
+
+Depois da introdução do resolver, a pergunta correta passou a ser:
+
+```text
+a plataforma possui uma identidade segura para esta linha?
+```
+
+Assim:
+
+```text
+device_serial_raw = NULL
+device_serial = 202527000021P
+method = LEGACY_IMEI
+```
+
+não deve ser rejeitado.
+
+## Como?
+
+A classificação passou a exigir também:
+
+```text
+device_serial
+device_resolution_method
+```
+
+como colunas de entrada.
+
+A responsabilidade ficou separada:
+
+```text
+identity_resolution
+→ decide identidade
+
+classification
+→ decide destino
+```
+
+---
+
+# 254. Remover a resolução de serial de dentro da transformação
+
+## O que?
+
+Antes da nova arquitetura, a transformação fazia:
+
+```sql
+REGEXP_REPLACE(
+    device_serial_raw,
+    '^M',
+    ''
+) AS device_serial
+```
+
+Essa lógica foi removida.
+
+A transformação passou apenas a preservar:
+
+```text
+device_serial
+device_resolution_method
+```
+
+já calculados pelo resolver.
+
+## Para que?
+
+Não deveria existir:
+
+```text
+resolver calcula identidade
+        ↓
+transformation recalcula identidade
+```
+
+Isso criaria duas fontes de verdade para a mesma regra.
+
+## Como?
+
+O fluxo passou a ser:
+
+```text
+identity_resolution
+        ↓
+device_serial definido
+        ↓
+classification
+        ↓
+transformation
+        ↓
+apenas tipa e projeta
+```
+
+A transformação continua responsável pelos demais campos de telemetria e identidade, mas não decide mais qual dispositivo representa a linha.
+
+---
+
+# 255. Persistir o método de resolução nos contratos Silver
+
+## O que?
+
+Os contratos em:
+
+```text
+src/queo_data_platform/contracts/silver.py
+```
+
+foram atualizados.
+
+Foi adicionada:
+
+```text
+device_resolution_method
+```
+
+em:
+
+```text
+telemetry_events
+device_identity_events
+rejected_logs
+```
+
+Também passou a existir:
+
+```text
+device_serial
+```
+
+explicitamente em:
+
+```text
+rejected_logs
+```
+
+## Para que?
+
+A plataforma precisa permitir auditoria posterior sobre a origem da identidade.
+
+Dois registros podem possuir:
+
+```text
+device_serial = 202527000021P
+```
+
+mas terem sido obtidos de maneiras diferentes:
+
+```text
+DIRECT
+```
+
+ou:
+
+```text
+LEGACY_IMEI
+```
+
+Essa distinção precisa permanecer depois da persistência Delta.
+
+## Como?
+
+Os três produtos agora carregam informação suficiente para responder:
+
+```text
+qual dispositivo foi associado?
+```
+
+e também:
+
+```text
+como essa identidade foi obtida?
+```
+
+Até um registro rejeitado pode indicar:
+
+```text
+UNRESOLVED
+```
+
+ou possuir uma identidade direta, mas ter sido rejeitado por outro motivo.
+
+---
+
+# 256. Detectar incompatibilidade de schema antes do incremental Silver
+
+## O que?
+
+Foi criada no serviço Silver uma verificação de contrato físico:
+
+```python
+delta_table_has_required_columns(...)
+```
+
+E:
+
+```python
+silver_supports_incremental_update(...)
+```
+
+deixou de verificar apenas se as tabelas Delta existem.
+
+Agora verifica também se elas possuem todas as colunas exigidas pelo contrato atual.
+
+## Para que?
+
+A introdução de:
+
+```text
+device_resolution_method
+```
+
+alterou o schema das Delta Tables Silver.
+
+As tabelas locais existentes ainda utilizavam o contrato antigo.
+
+Tentar executar incremental diretamente poderia escrever:
+
+```text
+schema novo
+```
+
+sobre:
+
+```text
+schema antigo
+```
+
+de forma incompatível.
+
+## Como?
+
+A Silver passa a consultar:
+
+```text
+telemetry_events
+device_identity_events
+rejected_logs
+```
+
+e comparar suas colunas com:
+
+```text
+TELEMETRY_SCHEMA
+DEVICE_IDENTITY_SCHEMA
+REJECTED_LOGS_SCHEMA
+```
+
+Se qualquer tabela estiver:
+
+```text
+ausente
+incompleta
+incompatível
+```
+
+o comportamento é:
+
+```text
+FULL de recuperação/migração
+```
+
+Assim, mudanças de contrato podem reconstruir a Silver de forma controlada.
+
+---
+
+# 257. Criar testes de classificação para identidade resolvida
+
+## O que?
+
+Os testes de:
+
+```text
+tests/unit/test_silver_classification.py
+```
+
+foram atualizados para incluir:
+
+```text
+device_serial
+device_resolution_method
+```
+
+Também foi criado cenário em que:
+
+```text
+device_serial_raw = NULL
+device_serial = 202527000021P
+device_resolution_method = LEGACY_IMEI
+```
+
+## Para que?
+
+Era necessário provar que uma identidade reconstruída corretamente deixa de ser classificada como:
+
+```text
+MISSING_DEVICE_SERIAL
+```
+
+## Como?
+
+O teste confirma:
+
+```text
+serial bruto ausente
++
+serial resolvido presente
+        ↓
+telemetry
+```
+
+e:
+
+```text
+rejected.empty
+```
+
+---
+
+# 258. Criar testes de transformação para preservar identidade resolvida
+
+## O que?
+
+Os testes de:
+
+```text
+tests/unit/test_silver_transformation.py
+```
+
+foram ajustados.
+
+O antigo teste que verificava remoção de prefixo durante transformação foi substituído pela validação de preservação da identidade já resolvida.
+
+## Para que?
+
+A transformação não é mais responsável por remover:
+
+```text
+M
+```
+
+ou determinar o dispositivo.
+
+Essa responsabilidade pertence a:
+
+```text
+identity_resolution.py
+```
+
+## Como?
+
+O teste fornece:
+
+```text
+device_serial_raw = M123456789
+device_serial = 123456789
+device_resolution_method = DIRECT
+```
+
+e verifica que a transformação devolve exatamente:
+
+```text
+device_serial = 123456789
+device_resolution_method = DIRECT
+```
+
+---
+
+# 259. Criar testes dos novos contratos Silver
+
+## O que?
+
+Foi adicionada cobertura em:
+
+```text
+tests/unit/test_silver_contracts.py
+```
+
+para:
+
+```text
+device_resolution_method
+```
+
+## Para que?
+
+Como o novo campo passou a fazer parte do contrato físico das Delta Tables, sua presença precisava ser protegida por teste.
+
+## Como?
+
+Os testes verificam que o campo existe como:
+
+```python
+pa.string()
+```
+
+em:
+
+```text
+TELEMETRY_SCHEMA
+DEVICE_IDENTITY_SCHEMA
+REJECTED_LOGS_SCHEMA
+```
+
+---
+
+# 260. Criar teste de integração para resolução FULL
+
+## O que?
+
+Foi adicionado em:
+
+```text
+tests/integration/test_silver_service.py
+```
+
+um cenário completo com:
+
+```text
+T1 moderna
++
+serial direto
++
+IMEI conhecido
+```
+
+e registros históricos:
+
+```text
+V14.06.111
++
+serial ausente
++
+mesmo IMEI/contexto
+```
+
+## Para que?
+
+Os testes unitários provavam as funções isoladas.
+
+Era necessário provar o fluxo real:
+
+```text
+Bronze
+↓
+normalization
+↓
+identity resolution
+↓
+classification
+↓
+transformation
+↓
+Delta Silver
+```
+
+## Como?
+
+A relação utilizada no teste foi:
+
+```text
+354173560222769
+        ↓
+202527000021P
+```
+
+Depois do FULL, a telemetria histórica precisa aparecer como:
+
+```text
+device_serial
+= 202527000021P
+
+device_resolution_method
+= LEGACY_IMEI
+```
+
+---
+
+# 261. Criar teste de integração para resolução INCREMENTAL
+
+## O que?
+
+Também foi criado um cenário de integração em que:
+
+```text
+primeira execução
+→ identidade moderna persistida
+```
+
+e depois:
+
+```text
+novo batch
+→ mensagem histórica sem serial
+```
+
+é processado incrementalmente.
+
+## Para que?
+
+Esse cenário valida especificamente o problema identificado anteriormente:
+
+```text
+evidência IMEI → serial
+fora do escopo incremental atual
+```
+
+## Como?
+
+Na primeira execução, a Silver persiste:
+
+```text
+device_identity_events
+```
+
+com identidade direta.
+
+Na segunda:
+
+```text
+historical_imei_to_serial
+```
+
+é construído a partir da tabela já persistida.
+
+O resultado esperado e observado pelos testes foi:
+
+```text
+mode = INCREMENTAL
+```
+
+e:
+
+```text
+LEGACY_IMEI
+```
+
+para a telemetria histórica.
+
+---
+
+# 262. Validar a nova implementação isoladamente
+
+## O que?
+
+Depois da integração foram executados os testes específicos da Silver.
+
+Os resultados foram:
+
+```text
+identity_resolution
+18 passed
+
+classification
+10 passed
+
+transformation
+11 passed
+
+contracts
+5 passed
+
+integration Silver
+9 passed
+```
+
+Total diretamente relacionado:
+
+```text
+53 testes
+```
+
+## Para que?
+
+Antes de executar a mudança sobre o Lakehouse histórico, era necessário confirmar que:
+
+```text
+resolver
++
+classificação
++
+transformação
++
+contratos
++
+serviço
+```
+
+estavam coerentes entre si.
+
+Também foram executados:
+
+```powershell
+uv run ruff check .
+```
+
+resultado:
+
+```text
+All checks passed!
+```
+
+e:
+
+```powershell
+uv run pyright
+```
+
+resultado:
+
+```text
+0 errors
+0 warnings
+0 informations
+```
+
+---
+
+# 263. Executar rebuild histórico com a nova semântica
+
+## O que?
+
+Depois da alteração do contrato Silver, o histórico local foi reprocessado.
+
+Como as tabelas Silver antigas ainda não possuíam:
+
+```text
+device_resolution_method
+```
+
+a verificação de compatibilidade provocou o rebuild necessário.
+
+A execução posterior do pipeline, já com o novo estado persistido, retornou:
+
+```text
+Bronze
+→ 0 novos arquivos
+
+Silver
+→ NOOP
+
+Gold
+→ NOOP
+```
+
+confirmando que a migração havia sido concluída anteriormente e o novo contrato já estava instalado.
+
+## Para que?
+
+A resolução de identidade altera o destino de registros históricos.
+
+Portanto, apenas mudar o código não seria suficiente.
+
+Era necessário recalcular:
+
+```text
+Bronze preservada
+        ↓
+Silver reconstruída
+        ↓
+Gold reconstruída
+```
+
+---
+
+# 264. Medir o efeito real da resolução sobre `MISSING_DEVICE_SERIAL`
+
+## O que?
+
+Antes da resolução histórica:
+
+```text
+MISSING_DEVICE_SERIAL
+= 55217
+```
+
+Depois do rebuild:
+
+```text
+TOTAL rejected_logs
+= 19286
+```
+
+com:
+
+```text
+MISSING_MESSAGE_TYPE     18771
+INVALID_MESSAGE_TYPE       273
+MISSING_DEVICE_SERIAL      242
+```
+
+## Para que?
+
+O diagnóstico original havia previsto que a maior parte das rejeições por serial ausente não representava dados inválidos.
+
+A medição real precisava comprovar isso.
+
+## Como?
+
+A redução foi:
+
+```text
+55217
+-
+242
+=
+54975
+```
+
+Portanto:
+
+```text
+54975 registros
+```
+
+deixaram de ser rejeitados por ausência de serial.
+
+Percentualmente, aproximadamente:
+
+```text
+99,56%
+```
+
+das antigas rejeições dessa categoria foram recuperadas.
+
+---
+
+# 265. Confirmar que os registros recuperados correspondem exatamente a `LEGACY_IMEI`
+
+## O que?
+
+Foi consultada:
+
+```text
+telemetry_events
+```
+
+O resultado foi:
+
+```text
+TOTAL: 67637
+
+LEGACY_IMEI    54814
+DIRECT         12823
+```
+
+Também foi consultada:
+
+```text
+device_identity_events
+```
+
+Resultado:
+
+```text
+TOTAL: 966
+
+DIRECT         805
+LEGACY_IMEI    161
+```
+
+## Para que?
+
+Era necessário verificar se a queda em:
+
+```text
+MISSING_DEVICE_SERIAL
+```
+
+correspondia realmente a registros identificados pela nova estratégia.
+
+## Como?
+
+Somando:
+
+```text
+54814 telemetry LEGACY_IMEI
++
+161 identity LEGACY_IMEI
+=
+54975
+```
+
+Esse valor é exatamente igual à redução observada:
+
+```text
+55217 - 242 = 54975
+```
+
+Portanto:
+
+```text
+registros que deixaram MISSING_DEVICE_SERIAL
+=
+registros classificados como LEGACY_IMEI
+```
+
+Essa igualdade é uma evidência importante de consistência do processamento.
+
+---
+
+# 266. Verificar o comportamento das identidades dentro de `rejected_logs`
+
+## O que?
+
+Foi analisado:
+
+```text
+device_resolution_method
+```
+
+em:
+
+```text
+rejected_logs
+```
+
+Resultado:
+
+```text
+UNRESOLVED    19126
+DIRECT          160
+```
+
+## Para que?
+
+Um registro rejeitado não necessariamente está sem identidade.
+
+Ele pode possuir identidade direta e ser rejeitado por:
+
+```text
+message_type inválido
+outro problema semântico
+```
+
+## Como?
+
+Os:
+
+```text
+160 DIRECT
+```
+
+mostram que:
+
+```text
+identidade resolvida
+```
+
+e:
+
+```text
+registro operacionalmente válido
+```
+
+são conceitos independentes.
+
+A Silver preserva essa distinção corretamente.
+
+---
+
+# 267. Validar a relação histórica real `IMEI → serial`
+
+## O que?
+
+Foi consultada a telemetria do dispositivo:
+
+```text
+202527000021P
+```
+
+Resultado:
+
+```text
+ROWS: 67567
+```
+
+distribuídos em:
+
+```text
+LEGACY_IMEI    54814
+DIRECT         12753
+```
+
+Também foi consultado:
+
+```text
+IMEI = 354173560222769
+```
+
+em:
+
+```text
+device_identity_events
+```
+
+## Para que?
+
+O teste controlado não era suficiente.
+
+Era necessário confirmar a relação usando os dados históricos reais.
+
+## Como?
+
+Foram encontradas identidades modernas como:
+
+```text
+device_serial_raw
+= M202527000021P
+
+device_serial
+= 202527000021P
+
+device_resolution_method
+= DIRECT
+```
+
+e identidades históricas como:
+
+```text
+device_serial_raw
+= NULL
+
+device_serial
+= 202527000021P
+
+device_resolution_method
+= LEGACY_IMEI
+```
+
+em arquivos de fevereiro e março.
+
+Isso confirmou empiricamente:
+
+```text
+354173560222769
+        ↓
+202527000021P
+```
+
+e mostrou que a relação foi aplicada ao histórico conforme planejado.
+
+---
+
+# 268. Medir o impacto da nova Silver sobre a Gold
+
+## O que?
+
+Depois da reconstrução causada pela nova semântica, foram consultadas as cinco tabelas Gold.
+
+O novo estado ficou:
+
+```text
+dim_device:             4
+device_last_position:   3
+device_route_points:    14612
+device_daily_summary:   84
+data_quality_summary:   95
+```
+
+Antes da resolução histórica, o estado observado era:
+
+```text
+dim_device:             3
+device_last_position:   2
+device_route_points:    12790
+device_daily_summary:   60
+data_quality_summary:   94
+```
+
+## Para que?
+
+Recuperar registros na Silver deve produzir impacto real nos produtos analíticos derivados.
+
+A Gold precisava refletir a nova interpretação do histórico.
+
+## Como?
+
+As diferenças foram:
+
+```text
+dim_device
+3 → 4
+
+device_last_position
+2 → 3
+
+device_route_points
+12790 → 14612
+
+device_daily_summary
+60 → 84
+
+data_quality_summary
+94 → 95
+```
+
+Isso confirmou que a reclassificação histórica não ficou restrita à Silver.
+
+Ela propagou corretamente para os produtos Gold.
+
+---
+
+# 269. Revalidar idempotência depois da migração semântica
+
+## O que?
+
+O pipeline foi executado novamente sem novos arquivos no inbox.
+
+O resultado foi:
+
+```text
+[BRONZE]
+discovered_files=0
+inserted_rows=0
+propagated_batches=0
+
+[SILVER]
+mode=NOOP
+
+[GOLD]
+mode=NOOP
+
+[PIPELINE]
+has_new_data=False
+has_changes=False
+```
+
+## Para que?
+
+Era necessário provar que o FULL de reconstrução aconteceu por necessidade de migração e não porque a nova lógica havia quebrado:
+
+```text
+batch_ids=()
+→ NOOP
+```
+
+## Como?
+
+Depois que os produtos estavam novamente compatíveis:
+
+```text
+Bronze sem batch novo
+        ↓
+Silver completa e compatível
+        ↓
+NOOP
+        ↓
+Gold
+        ↓
+NOOP
+```
+
+A semântica de repouso do pipeline permaneceu correta.
+
+---
+
+# 270. Executar regressão completa após a resolução histórica
+
+## O que?
+
+Foram executados:
+
+```powershell
+uv run ruff check .
+```
+
+resultado:
+
+```text
+All checks passed!
+```
+
+Depois:
+
+```powershell
+uv run pyright
+```
+
+resultado:
+
+```text
+0 errors
+0 warnings
+0 informations
+```
+
+E finalmente:
+
+```powershell
+uv run pytest
+```
+
+Resultado:
+
+```text
+186 passed
+```
+
+## Para que?
+
+A alteração atingiu uma regra estrutural da Silver e provocou mudanças observáveis na Gold.
+
+Era necessário confirmar que nenhuma outra parte da plataforma havia regredido.
+
+## Como?
+
+A suíte completa cobriu:
+
+```text
+Bronze
+Silver
+Gold
+Pipeline
+CLI
+Settings
+contratos
+writers
+incrementalidade
+integrações
+```
+
+O estado após a primeira integração da resolução histórica ficou completamente verde.
+
+---
+
+# 271. Investigar os 242 `MISSING_DEVICE_SERIAL` restantes
+
+## O que?
+
+Depois da recuperação de 54975 registros, ainda restavam:
+
+```text
+242
+```
+
+rejeições por:
+
+```text
+MISSING_DEVICE_SERIAL
+```
+
+Foi realizada uma investigação específica sobre esse conjunto.
+
+## Para que?
+
+O objetivo não era simplesmente reduzir o número de rejeições.
+
+Era necessário descobrir se os registros restantes eram:
+
+```text
+rejeições legítimas
+```
+
+ou:
+
+```text
+casos ainda recuperáveis
+```
+
+## Como?
+
+A distribuição por protocolo ficou:
+
+```text
+V14.06.111    126
+V14.06.117    108
+1               8
+```
+
+A distribuição de tipos de mensagem incluía:
+
+```text
+T1     57
+T3     51
+T27    24
+T31    21
+T28    19
+T23    12
+T9      8
+T6      8
+...
+```
+
+Todos os 242 possuíam:
+
+```text
+device_resolution_method
+= UNRESOLVED
+```
+
+e:
+
+```text
+device_serial_raw presente
+= 0
+
+device_serial presente
+= 0
+```
+
+Portanto eram realmente linhas ainda sem identidade.
+
+---
+
+# 272. Localizar os arquivos responsáveis pelos casos remanescentes
+
+## O que?
+
+Os:
+
+```text
+242
+```
+
+registros estavam concentrados em apenas:
+
+```text
+6 arquivos
+```
+
+A distribuição observada foi:
+
+```text
+logs_rastreador_2026-04-08.csv
+V14.06.111    121
+V14.06.117     34
+
+logs_rastreador_2026-03-27.csv
+V14.06.117     46
+V14.06.111      1
+
+logs_rastreador_2026-03-26.csv
+V14.06.117     28
+1               7
+
+logs_rastreador_2026-05-21.csv
+V14.06.111      2
+
+logs_rastreador_2026-05-20.csv
+V14.06.111      2
+
+logs_rastreador_2026-02-26.csv
+1               1
+```
+
+## Para que?
+
+A concentração em poucos arquivos permitiu investigar o contexto original de cada caso em vez de tratar os 242 como um conjunto homogêneo.
+
+---
+
+# 273. Separar novamente protocolos não cobertos pela estratégia legada
+
+## O que?
+
+Dos:
+
+```text
+242
+```
+
+restantes:
+
+```text
+108
+```
+
+eram:
+
+```text
+V14.06.117
+```
+
+e:
+
+```text
+8
+```
+
+utilizavam:
+
+```text
+protocol_version = 1
+```
+
+Total:
+
+```text
+116
+```
+
+## Para que?
+
+A implementação de:
+
+```text
+LEGACY_IMEI
+```
+
+foi criada especificamente para linhas:
+
+```text
+V14.06.111
+```
+
+Não havia decisão arquitetural autorizando inferir identidade para outras versões.
+
+Portanto esses:
+
+```text
+116
+```
+
+não deveriam ser automaticamente incorporados apenas para reduzir rejeições.
+
+## Consequência
+
+O foco da nova investigação passou a ser somente:
+
+```text
+126 registros V14.06.111
+```
+
+---
+
+# 274. Comparar a recuperação real com a previsão do diagnóstico
+
+## O que?
+
+O diagnóstico anterior havia identificado:
+
+```text
+55101
+```
+
+rejeições `MISSING_DEVICE_SERIAL` associadas a:
+
+```text
+V14.06.111
+```
+
+e estimado:
+
+```text
+55011
+```
+
+como potencialmente recuperáveis pela associação estudada.
+
+Após a primeira implementação foram recuperados:
+
+```text
+54975
+```
+
+## Para que?
+
+Essa comparação permitiu delimitar o problema residual.
+
+## Como?
+
+A diferença entre:
+
+```text
+recuperáveis previstos
+55011
+```
+
+e:
+
+```text
+recuperados efetivamente
+54975
+```
+
+é:
+
+```text
+36
+```
+
+Portanto, apesar de existirem:
+
+```text
+126
+```
+
+linhas `.111` ainda rejeitadas, somente:
+
+```text
+36
+```
+
+representavam inicialmente uma diferença em relação à previsão feita durante o diagnóstico.
+
+Isso indicava a existência de algum detalhe contextual ainda não considerado.
+
+---
+
+# 275. Executar o próprio resolver sobre os arquivos ainda rejeitados
+
+## O que?
+
+Foi utilizado:
+
+```python
+build_unambiguous_legacy_file_imei_map(...)
+```
+
+sobre a Bronze normalizada para verificar se os arquivos ainda rejeitados possuíam contexto reconhecido pelo código.
+
+Também foi consultado:
+
+```python
+build_unambiguous_imei_to_serial_map(...)
+```
+
+## Resultado
+
+A associação global estava correta:
+
+```text
+IMEI -> SERIAL:
+354173560222769
+→ 202527000021P
+```
+
+Porém os arquivos `.111` ainda rejeitados retornaram:
+
+```text
+logs_rastreador_2026-03-27.csv
+legacy_imei=None
+
+logs_rastreador_2026-04-08.csv
+legacy_imei=None
+
+logs_rastreador_2026-05-20.csv
+legacy_imei=None
+
+logs_rastreador_2026-05-21.csv
+legacy_imei=None
+```
+
+## Para que?
+
+Isso provou que o problema não estava em:
+
+```text
+IMEI
+→ serial
+```
+
+A falha estava no elo anterior:
+
+```text
+source_file
+→ IMEI
+```
+
+---
+
+# 276. Inspecionar as mensagens T1 dos arquivos remanescentes
+
+## O que?
+
+Foram extraídas da Bronze normalizada as mensagens:
+
+```text
+T1
+```
+
+dos arquivos ainda contendo:
+
+```text
+MISSING_DEVICE_SERIAL
++
+V14.06.111
+```
+
+## O que foi encontrado?
+
+### `logs_rastreador_2026-03-27.csv`
+
+As mensagens T1 eram:
+
+```text
+protocol_version
+= V14.06.117
+```
+
+A maior parte possuía:
+
+```text
+354173560222769]
+```
+
+que é sintaticamente inválido.
+
+Porém existiam também T1 com:
+
+```text
+354173560222769
+```
+
+válido.
+
+### `logs_rastreador_2026-04-08.csv`
+
+As mensagens T1 eram:
+
+```text
+V14.06.117
+```
+
+com:
+
+```text
+354173560222769
+```
+
+válido.
+
+### `logs_rastreador_2026-05-21.csv`
+
+As T1 eram:
+
+```text
+V14.06.117
+```
+
+e possuíam diretamente:
+
+```text
+device_serial_raw
+= M202527000021P
+
+IMEI
+= 354173560222769
+```
+
+### `logs_rastreador_2026-05-20.csv`
+
+Foi encontrada uma T1 com:
+
+```text
+protocol_version = 3.0
+```
+
+e:
+
+```text
+longitude_raw = NULL
+```
+
+Portanto o arquivo não fornecia IMEI contextual utilizável.
+
+---
+
+# 277. Descobrir que a versão da T1 contextual estava restringindo demais o resolver
+
+## O que?
+
+A investigação mostrou que:
+
+```python
+build_unambiguous_legacy_file_imei_map(...)
+```
+
+exigia originalmente:
+
+```python
+record.get(
+    "protocol_version"
+) == "V14.06.111"
+```
+
+para a própria mensagem T1 usada como evidência.
+
+## Problema
+
+Existiam arquivos com a seguinte estrutura:
+
+```text
+mesmo source_file
+│
+├── T1 V14.06.117
+│      ↓
+│   IMEI válido conhecido
+│
+└── mensagens V14.06.111
+       ↓
+    serial ausente
+```
+
+A identidade contextual do arquivo existia, mas era descartada porque:
+
+```text
+T1.version != V14.06.111
+```
+
+## Para que essa descoberta foi importante?
+
+A versão da T1 que fornece evidência e a versão da linha que recebe identidade são duas questões diferentes.
+
+O requisito realmente importante é:
+
+```text
+linha que será inferida
+→ precisa continuar dentro da estratégia legada autorizada
+```
+
+Não necessariamente:
+
+```text
+T1 que revela o IMEI
+→ precisa possuir a mesma versão
+```
+
+---
+
+# 278. Separar “fonte de evidência” de “linha elegível para inferência”
+
+## O que?
+
+Foi refinada a regra conceitual.
+
+A mensagem T1 que fornece contexto pode ser:
+
+```text
+outra protocol_version
+```
+
+desde que possua:
+
+```text
+T1
++
+timestamp válido
++
+IMEI válido
++
+source_file inequívoco
+```
+
+Entretanto, a linha que recebe:
+
+```text
+LEGACY_IMEI
+```
+
+continua obrigada a possuir:
+
+```text
+protocol_version = V14.06.111
+```
+
+## Para que?
+
+Isso permite utilizar uma evidência mais recente ou de outra versão no mesmo arquivo sem ampliar indiscriminadamente a resolução automática.
+
+A regra passa a ser:
+
+```text
+T1 contextual
+não precisa ser V14.06.111
+        ↓
+fornece source_file → IMEI
+```
+
+mas:
+
+```text
+registro candidato
+precisa ser V14.06.111
+        ↓
+pode receber LEGACY_IMEI
+```
+
+Assim, os:
+
+```text
+108 registros V14.06.117
+```
+
+continuam:
+
+```text
+UNRESOLVED
+```
+
+até que exista uma decisão específica para esse protocolo.
+
+---
+
+# 279. Permitir T1 cross-protocol como evidência contextual
+
+## O que?
+
+Foi alterada:
+
+```python
+build_unambiguous_legacy_file_imei_map(...)
+```
+
+A condição:
+
+```python
+if (
+    record.get(
+        "protocol_version"
+    )
+    != LEGACY_PROTOCOL_VERSION
+):
+    continue
+```
+
+foi removida da construção do contexto do arquivo.
+
+## Para que?
+
+A função precisa responder:
+
+```text
+qual IMEI inequívoco aparece em T1 válidas deste arquivo?
+```
+
+e não:
+
+```text
+qual IMEI aparece especificamente em uma T1 V14.06.111?
+```
+
+A restrição da versão continua dentro de:
+
+```python
+resolve_identity_dataframe(...)
+```
+
+para determinar quais registros podem efetivamente receber a identidade inferida.
+
+## Como?
+
+O comportamento passou a ser:
+
+```text
+T1 V14.06.117
++
+IMEI 354173560222769
++
+source_file A
+        ↓
+source_file A
+→ 354173560222769
+```
+
+Depois:
+
+```text
+linha V14.06.111
++
+source_file A
+        ↓
+354173560222769
+        ↓
+202527000021P
+        ↓
+LEGACY_IMEI
+```
+
+Enquanto:
+
+```text
+linha V14.06.117
++
+source_file A
+```
+
+continua não elegível à inferência pela estratégia atual.
+
+---
+
+# 280. Proteger o contexto cross-protocol com novos testes unitários
+
+## O que?
+
+Foram adicionados novos cenários em:
+
+```text
+tests/unit/test_silver_identity_resolution.py
+```
+
+## Cenários adicionados
+
+### T1 de outra versão fornece contexto
+
+```text
+T1
+V14.06.117
+IMEI válido
+        ↓
+arquivo entra no mapa contextual
+```
+
+### Contexto cross-protocol resolve linha `.111`
+
+```text
+T1 V14.06.117
+        ↓
+IMEI conhecido
+        ↓
+T2 V14.06.111
+        ↓
+LEGACY_IMEI
+```
+
+### Contexto não libera inferência para `.117`
+
+```text
+T1 V14.06.117
+        ↓
+IMEI conhecido
+        ↓
+T2 V14.06.117
+        ↓
+UNRESOLVED
+```
+
+### IMEI malformado não invalida um IMEI válido do mesmo arquivo
+
+Foi reproduzido o padrão real:
+
+```text
+354173560222769]
+```
+
+junto de:
+
+```text
+354173560222769
+```
+
+A entrada malformada é ignorada.
+
+A válida continua podendo fornecer contexto.
+
+## Para que?
+
+A mudança amplia apenas a origem da evidência.
+
+Os testes garantem que ela não amplia acidentalmente o conjunto de protocolos que podem receber identidade inferida.
+
+---
+
+# 281. Criar teste de integração para contexto T1 entre protocolos
+
+## O que?
+
+Foi adicionado em:
+
+```text
+tests/integration/test_silver_service.py
+```
+
+o cenário:
+
+```text
+T1 moderna com serial + IMEI
+        ↓
+mapa IMEI → serial
+```
+
+junto de:
+
+```text
+T1 V14.06.117
++
+sem serial
++
+mesmo IMEI
++
+source_file compartilhado
+```
+
+e:
+
+```text
+T2 V14.06.111
++
+sem serial
++
+mesmo source_file
+```
+
+## Para que?
+
+Era necessário provar que o comportamento não funcionava apenas no resolver isolado.
+
+A Silver completa precisa interpretar:
+
+```text
+T1 cross-protocol
+→ contexto
+```
+
+e depois:
+
+```text
+linha V14.06.111
+→ LEGACY_IMEI
+```
+
+sem alterar a classificação de protocolos não autorizados.
+
+## Como?
+
+O teste espera que a telemetria final possua:
+
+```text
+device_serial
+= 202527000021P
+```
+
+e:
+
+```text
+device_resolution_method
+= LEGACY_IMEI
+```
+
+---
+
+# 282. Versionar o refinamento de contexto entre protocolos
+
+## O que?
+
+O ajuste foi versionado no commit:
+
+```text
+750573e
+fix: allow cross-protocol T1 identity context
+```
+
+O commit modificou:
+
+```text
+src/queo_data_platform/silver/identity_resolution.py
+
+tests/unit/test_silver_identity_resolution.py
+
+tests/integration/test_silver_service.py
+```
+
+## Para que?
+
+Manter o refinamento separado e rastreável em relação à integração inicial da resolução de identidade.
+
+O histórico de commits dessa evolução ficou:
+
+```text
+e910a71
+feat: identity resolution
+
+4bad7cc
+feat: make Silver identity resolution incremental-safe
+
+2c8f76b
+feat: integrate legacy identity resolution into Silver
+
+750573e
+fix: allow cross-protocol T1 identity context
+```
+
+---
+
+# 283. Estado atual da resolução histórica
+
+## O que?
+
+A primeira versão integrada da resolução foi validada sobre o histórico real e produziu:
+
+```text
+MISSING_DEVICE_SERIAL
+55217
+→
+242
+```
+
+com:
+
+```text
+54975
+```
+
+registros recuperados.
+
+Também foram comprovados:
+
+```text
+FULL
+NOOP
+INCREMENTAL
+```
+
+na implementação anterior do resolver.
+
+A suíte completa antes do refinamento cross-protocol estava em:
+
+```text
+186 passed
+```
+
+com:
+
+```text
+ruff
+✅
+
+pyright
+0 errors
+0 warnings
+```
+
+## Estado do refinamento mais recente
+
+O ajuste:
+
+```text
+cross-protocol T1 context
+```
+
+já foi implementado e versionado.
+
+A investigação indica que ele deve permitir recuperar registros `.111` de arquivos como:
+
+```text
+logs_rastreador_2026-03-27.csv
+logs_rastreador_2026-04-08.csv
+logs_rastreador_2026-05-21.csv
+```
+
+sem liberar automaticamente inferência para:
+
+```text
+V14.06.117
+```
+
+ou:
+
+```text
+protocol_version = 1
+```
+
+O arquivo:
+
+```text
+logs_rastreador_2026-05-20.csv
+```
+
+continua sem evidência contextual de IMEI utilizável e deve permanecer candidato a:
+
+```text
+UNRESOLVED
+```
+
+---
+
+# 284. Próximo ponto exato de retomada
+
+O próximo trabalho não deve ser ainda:
+
+```text
+Query Layer
+```
+
+Antes disso, o refinamento:
+
+```text
+fix: allow cross-protocol T1 identity context
+```
+
+precisa ser validado operacionalmente sobre o histórico real.
+
+A sequência recomendada para retomada é:
+
+```text
+1. executar Ruff
+        ↓
+2. executar Pyright
+        ↓
+3. executar testes unitários do resolver
+        ↓
+4. executar integração Silver
+        ↓
+5. executar suíte completa
+        ↓
+6. reconstruir Silver explicitamente
+        ↓
+7. reconstruir Gold
+        ↓
+8. medir novamente MISSING_DEVICE_SERIAL
+        ↓
+9. confirmar quais casos permanecem UNRESOLVED
+        ↓
+10. validar NOOP depois do rebuild
+        ↓
+11. atualizar diagnóstico técnico
+        ↓
+12. somente então encerrar a frente de identity resolution
+        ↓
+13. iniciar Query Layer
+```
+
+A expectativa quantitativa levantada na investigação atual é que:
+
+```text
+MISSING_DEVICE_SERIAL
+242
+```
+
+possa cair aproximadamente para:
+
+```text
+118
+```
+
+caso os contextos cross-protocol identificados expliquem todos os casos esperados.
+
+Esse valor ainda não deve ser tratado como resultado confirmado.
+
+Ele é uma hipótese operacional a ser validada no rebuild seguinte.
+
+O princípio permanece:
+
+```text
+não reduzir rejeições artificialmente
+```
+
+e sim:
+
+```text
+recuperar somente registros
+com identidade sustentada por evidência inequívoca
+```
+
+Esse é o ponto exato de retomada do desenvolvimento.
