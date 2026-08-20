@@ -301,10 +301,19 @@ def build_unambiguous_legacy_file_imei_map(
     dataframe: pd.DataFrame,
 ) -> dict[str, str]:
     """
-    Descobre o IMEI contextual de cada arquivo legado.
+    Descobre o IMEI contextual de arquivos que podem
+    fornecer identidade para mensagens do protocolo legado.
 
-    Um arquivo somente entra no mapa quando possui
+    A mensagem T1 utilizada como evidência contextual
+    não precisa possuir a mesma protocol_version da linha
+    legada que será posteriormente resolvida.
+
+    O arquivo somente entra no mapa quando possui
     exatamente um IMEI T1 válido distinto.
+
+    A restrição de quais protocolos podem receber
+    identidade inferida permanece em
+    resolve_identity_dataframe().
     """
 
     validate_identity_resolution_input(dataframe)
@@ -315,9 +324,6 @@ def build_unambiguous_legacy_file_imei_map(
     ] = {}
 
     for record in dataframe.to_dict(orient="records"):
-        if record.get("protocol_version") != LEGACY_PROTOCOL_VERSION:
-            continue
-
         if record.get("message_type") != "T1":
             continue
 

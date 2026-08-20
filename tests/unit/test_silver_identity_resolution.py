@@ -428,3 +428,120 @@ def test_legacy_resolution_normalizes_source_file() -> None:
         ]
         == "LEGACY_IMEI"
     )
+
+
+def test_legacy_file_map_accepts_t1_from_other_protocol_version() -> None:
+    dataframe = pd.DataFrame(
+        [
+            build_normalized_row(
+                message_type="T1",
+                protocol_version="V14.06.117",
+                longitude_raw=KNOWN_IMEI,
+                source_file="mixed-protocol.csv",
+            )
+        ]
+    )
+
+    result = build_unambiguous_legacy_file_imei_map(dataframe)
+
+    assert result == {"mixed-protocol.csv": KNOWN_IMEI}
+
+
+def test_cross_protocol_t1_resolves_legacy_row() -> None:
+    dataframe = pd.DataFrame(
+        [
+            build_normalized_row(
+                message_type="T1",
+                protocol_version="V14.06.117",
+                longitude_raw=KNOWN_IMEI,
+                source_file="mixed-protocol.csv",
+            ),
+            build_normalized_row(
+                message_type="T2",
+                protocol_version="V14.06.111",
+                source_file="mixed-protocol.csv",
+            ),
+        ]
+    )
+
+    resolved = resolve_identity_dataframe(
+        dataframe,
+        imei_to_serial={KNOWN_IMEI: (KNOWN_DEVICE_SERIAL)},
+    )
+
+    assert (
+        resolved.loc[
+            1,
+            "device_serial",
+        ]
+        == KNOWN_DEVICE_SERIAL
+    )
+
+    assert (
+        resolved.loc[
+            1,
+            "device_resolution_method",
+        ]
+        == "LEGACY_IMEI"
+    )
+
+
+def test_cross_protocol_context_does_not_resolve_non_legacy_row() -> None:
+    dataframe = pd.DataFrame(
+        [
+            build_normalized_row(
+                message_type="T1",
+                protocol_version="V14.06.117",
+                longitude_raw=KNOWN_IMEI,
+                source_file="mixed-protocol.csv",
+            ),
+            build_normalized_row(
+                message_type="T2",
+                protocol_version="V14.06.117",
+                source_file="mixed-protocol.csv",
+            ),
+        ]
+    )
+
+    resolved = resolve_identity_dataframe(
+        dataframe,
+        imei_to_serial={KNOWN_IMEI: (KNOWN_DEVICE_SERIAL)},
+    )
+
+    assert pd.isna(
+        resolved.loc[
+            1,
+            "device_serial",
+        ]
+    )
+
+    assert (
+        resolved.loc[
+            1,
+            "device_resolution_method",
+        ]
+        == "UNRESOLVED"
+    )
+
+
+def test_legacy_file_map_ignores_malformed_imei_when_valid_one_exists() -> None:
+    dataframe = pd.DataFrame(
+        [
+            build_normalized_row(
+                message_type="T1",
+                protocol_version="V14.06.117",
+                longitude_raw=("354173560222769]"),
+                source_file="mixed-protocol.csv",
+            ),
+            build_normalized_row(
+                message_type="T1",
+                protocol_version="V14.06.117",
+                longitude_raw=KNOWN_IMEI,
+                source_file="mixed-protocol.csv",
+            ),
+        ]
+    )
+
+    result = build_unambiguous_legacy_file_imei_map(dataframe)
+
+    assert result == {"mixed-protocol.csv": KNOWN_IMEI}

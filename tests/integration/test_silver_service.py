@@ -664,3 +664,73 @@ def test_empty_batch_ids_return_noop_when_silver_exists(
     assert result.identity_rows_written == 0
 
     assert result.rejected_rows_written == 0
+
+
+def test_full_rebuild_resolves_legacy_identity_from_cross_protocol_t1(
+    tmp_path: Path,
+) -> None:
+    bronze_dir = tmp_path / "01_bronze"
+    silver_dir = tmp_path / "02_silver"
+
+    modern_identity = build_bronze_row(
+        row_id="modern-identity",
+        batch_id="batch-modern",
+        event_date="2026-08-17",
+        message_type="T1",
+    )
+
+    modern_identity["S/N ou IMEI"] = KNOWN_DEVICE_SERIAL_RAW
+
+    modern_identity["LONT"] = KNOWN_IMEI
+
+    contextual_identity = build_bronze_row(
+        row_id="contextual-identity",
+        batch_id="batch-legacy",
+        event_date="2026-08-18",
+        message_type="T1",
+    )
+
+    contextual_identity["PRT_VER"] = "V14.06.117"
+
+    contextual_identity["S/N ou IMEI"] = ""
+
+    contextual_identity["LONT"] = KNOWN_IMEI
+
+    contextual_identity["source_file"] = "mixed-protocol.csv"
+
+    legacy_telemetry = build_bronze_row(
+        row_id="legacy-telemetry",
+        batch_id="batch-legacy",
+        event_date="2026-08-18",
+        message_type="T2",
+    )
+
+    legacy_telemetry["PRT_VER"] = "V14.06.111"
+
+    legacy_telemetry["S/N ou IMEI"] = ""
+
+    legacy_telemetry["source_file"] = "mixed-protocol.csv"
+
+    write_bronze_rows(
+        bronze_dir,
+        [
+            modern_identity,
+            contextual_identity,
+            legacy_telemetry,
+        ],
+    )
+
+    result = load_silver_data(
+        bronze_dir=bronze_dir,
+        silver_dir=silver_dir,
+    )
+
+    assert result.mode == "FULL"
+
+    telemetry = DeltaTable(str(silver_dir / TELEMETRY_TABLE_NAME)).to_pandas()
+
+    legacy = telemetry.loc[telemetry["row_id"] == "legacy-telemetry"].iloc[0]
+
+    assert legacy["device_serial"] == KNOWN_DEVICE_SERIAL
+
+    assert legacy["device_resolution_method"] == "LEGACY_IMEI"
